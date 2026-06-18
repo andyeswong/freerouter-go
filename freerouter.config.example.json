@@ -1,0 +1,13 @@
+{
+  "listen": ":8080",
+  "db_path": "freerouter.db",
+  "heuristic": {
+    "simple_keywords": ["hi", "hello", "thanks", "yes", "no", "ok"],
+    "reasoning_keywords": ["prove", "derive", "analyze", "reason", "step by step"],
+    "code_keywords": ["function", "code", "bug", "refactor", "compile", "regex", "sql"],
+    "agentic_keywords": ["run", "execute", "ssh", "deploy", "ping", "curl", "shell", "browse"],
+    "simple_medium": 0.0,
+    "medium_complex": 1.0,
+    "complex_reason": 2.0
+  }
+}
