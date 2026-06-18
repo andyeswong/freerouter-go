@@ -1,4 +1,4 @@
-// FreeRouter-Go — data-driven, OpenAI-compatible LLM router.
+// FreeRouter-Go — data-driven, OpenAI-compatible LLM router with per-dev tokens.
 // Build static: CGO_ENABLED=0 go build -o freerouter .
 package main
 
@@ -8,10 +8,12 @@ import (
 	"github.com/glebarez/sqlite" // pure-Go sqlite driver (no CGO)
 	"gorm.io/gorm"
 
+	"github.com/andyeswong/freerouter-go/internal/auth"
 	"github.com/andyeswong/freerouter-go/internal/config"
 	"github.com/andyeswong/freerouter-go/internal/models"
 	"github.com/andyeswong/freerouter-go/internal/router"
 	"github.com/andyeswong/freerouter-go/internal/server"
+	"github.com/andyeswong/freerouter-go/internal/usage"
 )
 
 func main() {
@@ -26,12 +28,20 @@ func main() {
 	}
 
 	repo := models.NewRepo(db)
-	if err := repo.AutoMigrate(); err != nil {
-		log.Fatalf("migrate: %v", err)
+	tokens := auth.NewRepo(db)
+	usageRepo := usage.NewRepo(db)
+	for _, m := range []func() error{repo.AutoMigrate, tokens.AutoMigrate, usageRepo.AutoMigrate} {
+		if err := m(); err != nil {
+			log.Fatalf("migrate: %v", err)
+		}
+	}
+
+	if cfg.AdminToken == "" {
+		log.Print("WARNING: admin token unset — /admin/* is OPEN. Set FRGO_ADMIN_TOKEN.")
 	}
 
 	rt := router.New(repo, cfg.Heuristic)
-	srv := server.New(repo, rt)
+	srv := server.New(repo, rt, tokens, usageRepo, cfg.AdminToken)
 
 	log.Printf("FreeRouter-Go listening on %s (db=%s)", cfg.Listen, cfg.DBPath)
 	if err := srv.Engine().Run(cfg.Listen); err != nil {

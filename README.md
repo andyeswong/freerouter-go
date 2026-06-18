@@ -64,9 +64,31 @@ OpenAI-compatible surface + a small admin API for the vademécum.
 | PUT    | `/admin/models/:id`        | update a model                                     |
 | DELETE | `/admin/models/:id`        | remove a model                                     |
 | POST   | `/admin/models/:id/scan`   | probe endpoint, record `health`                    |
+| GET    | `/admin/tokens`            | list issued dev tokens (prefix, enabled, last used) |
+| POST   | `/admin/tokens`            | issue a token `{"name":"dev"}` → plaintext shown ONCE |
+| POST   | `/admin/tokens/:id/revoke` | disable a token                                    |
+| POST   | `/admin/tokens/:id/enable` | re-enable a token                                  |
+| GET    | `/admin/usage`             | usage aggregated by user+model (`?user=&model=&from=&to=`) |
+| GET    | `/admin/usage/recent`      | raw usage records (`?limit=`)                      |
 
 Every `/v1/chat/completions` response carries the routing decision in headers:
 `X-FreeRouter-Model`, `X-FreeRouter-Tier`, `X-FreeRouter-Savings`.
+
+## Auth & usage
+
+FreeRouter is a **gateway**: hand each dev a single `frgo_…` token instead of
+every provider's key. Tokens are stored hashed (sha256); the plaintext is shown
+once at issue time.
+
+- `/v1/*` requires `Authorization: Bearer frgo_…` (per-dev token).
+- `/admin/*` requires the static admin token (`FRGO_ADMIN_TOKEN` env or
+  `admin_token` in config). If unset, `/admin` is open and a warning is logged.
+- Every billed request records `{user, model, tier, prompt/completion/total
+  tokens, cost}`. Token counts are the upstream's real numbers; streamed
+  requests get `stream_options.include_usage` injected so they bill too.
+
+Query "who used how many tokens of which model": `GET /admin/usage` returns
+buckets grouped by `user` + `model`.
 
 ### Caller hints (data-driven path)
 

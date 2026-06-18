@@ -87,6 +87,12 @@ func Proxy(m models.LlmModel, rawBody []byte) (*http.Response, error) {
 	delete(body, "tier")
 	delete(body, "requires_mcp")
 
+	// Ask the upstream to include token usage in the final stream chunk so we
+	// can bill streamed requests too (OpenAI-compatible stream_options).
+	if s, _ := body["stream"].(bool); s {
+		body["stream_options"] = map[string]any{"include_usage": true}
+	}
+
 	out, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -121,3 +127,44 @@ func ExtractPrompt(msgs []Message) (user, system string) {
 
 // Drain is a small helper to fully read+close a response body.
 func Drain(r io.ReadCloser) { _, _ = io.Copy(io.Discard, r); _ = r.Close() }
+
+// Usage holds the token counts reported by the upstream.
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// ParseUsage extracts token usage from a full response body. Handles both a
+// plain JSON completion and an SSE stream (scans `data:` lines, keeps the last
+// one carrying a usage object — that's the include_usage final chunk).
+func ParseUsage(body []byte) Usage {
+	var u Usage
+
+	// Non-stream: a single JSON object with a top-level "usage".
+	var obj struct {
+		Usage Usage `json:"usage"`
+	}
+	if json.Unmarshal(body, &obj) == nil && obj.Usage.TotalTokens > 0 {
+		return obj.Usage
+	}
+
+	// Stream: walk SSE lines.
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Usage *Usage `json:"usage"`
+		}
+		if json.Unmarshal([]byte(payload), &chunk) == nil && chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+			u = *chunk.Usage
+		}
+	}
+	return u
+}

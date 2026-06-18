@@ -12,9 +12,10 @@ import (
 )
 
 type Config struct {
-	Listen    string                 `json:"listen"`     // e.g. ":8080"
-	DBPath    string                 `json:"db_path"`    // sqlite file
-	Heuristic router.HeuristicConfig `json:"heuristic"`
+	Listen     string                 `json:"listen"`      // e.g. ":8080"
+	DBPath     string                 `json:"db_path"`     // sqlite file
+	AdminToken string                 `json:"admin_token"` // gates /admin/*; env FRGO_ADMIN_TOKEN overrides
+	Heuristic  router.HeuristicConfig `json:"heuristic"`
 }
 
 func defaults() Config {
@@ -57,6 +58,9 @@ func Load() (Config, error) {
 	if cfg.DBPath != "" && !filepath.IsAbs(cfg.DBPath) {
 		// keep relative to cwd; explicit for clarity
 		cfg.DBPath = filepath.Clean(cfg.DBPath)
+	}
+	if env := os.Getenv("FRGO_ADMIN_TOKEN"); env != "" {
+		cfg.AdminToken = env
 	}
 	return cfg, nil
 }
