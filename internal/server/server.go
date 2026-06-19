@@ -86,10 +86,12 @@ func (s *Server) chat(c *gin.Context) {
 	}
 
 	user, system := providers.ExtractPrompt(req.Messages)
+	ctxChars := providers.ContextChars(req.Messages)
 	decision, err := s.rt.Route(router.Request{
 		Prompt:       user,
 		SystemPrompt: system,
 		MaxTokens:    req.MaxTokens,
+		ContextChars: ctxChars,
 		Tier:         models.Tier(req.Tier),
 		RequiresMCP:  req.RequiresMCP,
 	})
@@ -119,17 +121,39 @@ func (s *Server) chat(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, io.TeeReader(resp.Body, &buf))
 
 	if resp.StatusCode < 400 {
-		s.recordUsage(c, decision, buf.Bytes())
+		s.recordUsage(c, decision, buf.Bytes(), ctxChars)
 	}
 }
 
-// recordUsage parses upstream token counts and writes a usage row for the dev.
-func (s *Server) recordUsage(c *gin.Context, d *router.Decision, body []byte) {
+// recordUsage parses upstream token counts, calibrates the model's
+// chars-per-token ratio (EMA), and writes a usage row. promptChars is the size
+// of the input (all messages) — used to estimate prompt tokens when the
+// provider doesn't report them (e.g. Ollama Cloud only returns completion).
+func (s *Server) recordUsage(c *gin.Context, d *router.Decision, body []byte, promptChars int) {
 	tok, ok := auth.TokenFromCtx(c)
 	if !ok {
 		return
 	}
 	u := providers.ParseUsage(body)
+
+	estimated := false
+	if u.PromptTokens > 0 {
+		// Real count: fold the observed ratio into the model's EMA (alpha 0.2).
+		observed := float64(promptChars) / float64(u.PromptTokens)
+		_ = s.repo.UpdateCharsPerToken(d.Model.ID, observed, 0.2)
+	} else if promptChars > 0 {
+		// Provider didn't report prompt tokens — estimate from the model's ratio.
+		cpt := d.Model.CharsPerToken
+		if cpt <= 0 {
+			cpt = 4
+		}
+		u.PromptTokens = int(float64(promptChars) / cpt)
+		estimated = true
+	}
+	if u.TotalTokens == 0 || estimated {
+		u.TotalTokens = u.PromptTokens + u.CompletionTokens
+	}
+
 	cost := float64(u.PromptTokens)/1e6*d.Model.InputPrice +
 		float64(u.CompletionTokens)/1e6*d.Model.OutputPrice
 
@@ -142,6 +166,7 @@ func (s *Server) recordUsage(c *gin.Context, d *router.Decision, body []byte) {
 		CompletionTokens: u.CompletionTokens,
 		TotalTokens:      u.TotalTokens,
 		CostEstimate:     cost,
+		Estimated:        estimated,
 	})
 }
 

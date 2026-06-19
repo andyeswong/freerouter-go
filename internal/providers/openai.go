@@ -130,6 +130,17 @@ func ExtractPrompt(msgs []Message) (user, system string) {
 	return user, strings.Join(sys, "\n")
 }
 
+// ContextChars sums characters across ALL messages (plus a small per-message
+// overhead for role/formatting tokens). This is the real size of the request —
+// used to size context for routing, unlike the last-prompt-only classifier.
+func ContextChars(msgs []Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += len(m.Content) + 8
+	}
+	return n
+}
+
 // Drain is a small helper to fully read+close a response body.
 func Drain(r io.ReadCloser) { _, _ = io.Copy(io.Discard, r); _ = r.Close() }
 

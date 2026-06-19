@@ -50,6 +50,12 @@ type LlmModel struct {
 	OutputPrice   float64 `json:"output_price"` // USD per 1M output tokens
 	ContextWindow int     `json:"context_window"`
 
+	// CharsPerToken is the empirical chars-per-token ratio for this model,
+	// auto-calibrated (EMA) from real usage.prompt_tokens on every request.
+	// Used to size context for routing and to estimate token counts when a
+	// provider doesn't report them. Default 4.0.
+	CharsPerToken float64 `gorm:"default:4" json:"chars_per_token"`
+
 	TierMax   Tier `gorm:"index" json:"tier_max"`
 	Cost      int  `gorm:"index" json:"cost"`   // ordering rank, lower = cheaper
 	Weight    int  `json:"weight"`              // tie-breaker, higher = preferred

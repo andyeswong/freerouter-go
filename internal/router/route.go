@@ -12,6 +12,7 @@ type Request struct {
 	Prompt       string
 	SystemPrompt string
 	MaxTokens    int
+	ContextChars int // total chars across ALL messages (for context sizing); 0 = derive from prompt+system
 
 	// Optional declared metadata (data-driven path, preferred over heuristics).
 	Tier         models.Tier // 0 = let the classifier decide
@@ -72,12 +73,18 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 		requiresMCP = AgenticScore(prompt, rt.cfg)
 	}
 
-	total := estTokens(req.SystemPrompt) + estTokens(prompt) + req.MaxTokens
+	// Size the real request by ALL messages, not just the last prompt.
+	ctxChars := req.ContextChars
+	if ctxChars == 0 {
+		ctxChars = len(req.SystemPrompt) + len(req.Prompt)
+	}
 
 	cands, err := rt.repo.CandidatesFor(models.CandidateQuery{
-		Tier:        tier,
-		RequiresMCP: requiresMCP,
-		MinContext:  total,
+		Tier:         tier,
+		RequiresMCP:  requiresMCP,
+		ContextChars: ctxChars,
+		MaxOutput:    req.MaxTokens,
+		Margin:       1.2,
 	})
 	if err != nil {
 		return nil, err
@@ -105,7 +112,13 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 		Method:      method,
 		RequiresMCP: requiresMCP,
 	}
-	rt.computeSavings(d, total, req.MaxTokens)
+	// Estimate input tokens for the savings calc using the chosen model's ratio.
+	cpt := pick.CharsPerToken
+	if cpt <= 0 {
+		cpt = 4
+	}
+	estInput := int(float64(ctxChars) / cpt)
+	rt.computeSavings(d, estInput, req.MaxTokens)
 	d.Reason = method + " -> tier " + tierName(tier)
 	return d, nil
 }

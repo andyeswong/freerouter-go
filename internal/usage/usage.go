@@ -19,7 +19,8 @@ type Record struct {
 	PromptTokens     int     `json:"prompt_tokens"`
 	CompletionTokens int     `json:"completion_tokens"`
 	TotalTokens      int     `json:"total_tokens"`
-	CostEstimate     float64 `json:"cost_estimate"` // USD, from model pricing × actual tokens
+	CostEstimate     float64 `json:"cost_estimate"` // USD, from model pricing × tokens
+	Estimated        bool    `json:"estimated"`     // true when the provider didn't report prompt_tokens and we estimated them
 
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
