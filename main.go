@@ -8,10 +8,14 @@ import (
 	"github.com/glebarez/sqlite" // pure-Go sqlite driver (no CGO)
 	"gorm.io/gorm"
 
+	"os"
+
 	"github.com/andyeswong/freerouter-go/internal/auth"
 	"github.com/andyeswong/freerouter-go/internal/config"
 	"github.com/andyeswong/freerouter-go/internal/models"
+	"github.com/andyeswong/freerouter-go/internal/providers"
 	"github.com/andyeswong/freerouter-go/internal/router"
+	"github.com/andyeswong/freerouter-go/internal/secrets"
 	"github.com/andyeswong/freerouter-go/internal/server"
 	"github.com/andyeswong/freerouter-go/internal/usage"
 )
@@ -30,10 +34,19 @@ func main() {
 	repo := models.NewRepo(db)
 	tokens := auth.NewRepo(db)
 	usageRepo := usage.NewRepo(db)
-	for _, m := range []func() error{repo.AutoMigrate, tokens.AutoMigrate, usageRepo.AutoMigrate} {
+	secretsRepo := secrets.NewRepo(db)
+	for _, m := range []func() error{repo.AutoMigrate, tokens.AutoMigrate, usageRepo.AutoMigrate, secretsRepo.AutoMigrate} {
 		if err := m(); err != nil {
 			log.Fatalf("migrate: %v", err)
 		}
+	}
+
+	// Resolve provider keys from the DB secret store first, then env vars.
+	providers.KeyResolver = func(ref string) string {
+		if v, ok := secretsRepo.Get(ref); ok {
+			return v
+		}
+		return os.Getenv(ref)
 	}
 
 	if cfg.AdminToken == "" {
@@ -41,7 +54,7 @@ func main() {
 	}
 
 	rt := router.New(repo, cfg.Heuristic)
-	srv := server.New(repo, rt, tokens, usageRepo, cfg.AdminToken)
+	srv := server.New(repo, rt, tokens, usageRepo, secretsRepo, cfg.AdminToken)
 
 	log.Printf("FreeRouter-Go listening on %s (db=%s)", cfg.Listen, cfg.DBPath)
 	if err := srv.Engine().Run(cfg.Listen); err != nil {

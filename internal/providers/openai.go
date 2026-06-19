@@ -74,6 +74,11 @@ type ChatRequest struct {
 
 var httpClient = &http.Client{Timeout: 300 * time.Second}
 
+// KeyResolver maps a model's api_key_ref to the actual key. Defaults to env
+// lookup; main wires it to check the DB secret store first, then env, so keys
+// can be added/rotated at runtime without a restart.
+var KeyResolver = func(ref string) string { return os.Getenv(ref) }
+
 // Proxy forwards rawBody to the model's endpoint, rewriting the model id and
 // injecting the API key resolved from the model's APIKeyRef env var. Returns
 // the upstream response for the handler to stream/relay.
@@ -104,7 +109,7 @@ func Proxy(m models.LlmModel, rawBody []byte) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := os.Getenv(m.APIKeyRef); key != "" {
+	if key := KeyResolver(m.APIKeyRef); key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	return httpClient.Do(req)

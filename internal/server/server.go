@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"os"
 	"strconv"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/andyeswong/freerouter-go/internal/models"
 	"github.com/andyeswong/freerouter-go/internal/providers"
 	"github.com/andyeswong/freerouter-go/internal/router"
+	"github.com/andyeswong/freerouter-go/internal/secrets"
 	"github.com/andyeswong/freerouter-go/internal/usage"
 )
 
@@ -23,11 +25,12 @@ type Server struct {
 	rt         *router.Router
 	tokens     *auth.Repo
 	usage      *usage.Repo
+	secrets    *secrets.Repo
 	adminToken string
 }
 
-func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, adminToken string) *Server {
-	return &Server{repo: repo, rt: rt, tokens: tokens, usage: usageRepo, adminToken: adminToken}
+func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, secretsRepo *secrets.Repo, adminToken string) *Server {
+	return &Server{repo: repo, rt: rt, tokens: tokens, usage: usageRepo, secrets: secretsRepo, adminToken: adminToken}
 }
 
 func (s *Server) Engine() *gin.Engine {
@@ -59,6 +62,11 @@ func (s *Server) Engine() *gin.Engine {
 
 		admin.GET("/usage", s.usageReport)
 		admin.GET("/usage/recent", s.usageRecent)
+
+		admin.GET("/secrets", s.secretList)
+		admin.POST("/secrets", s.secretSet)
+		admin.DELETE("/secrets/:name", s.secretDelete)
+		admin.GET("/keys", s.keyList)
 	}
 	return r
 }
@@ -318,4 +326,107 @@ func (s *Server) usageRecent(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"records": recs})
+}
+
+// ---- admin: secrets (provider keys, DB-backed, hot — no restart) ----
+
+func (s *Server) secretList(c *gin.Context) {
+	items, err := s.secrets.List()
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, items)
+}
+
+func (s *Server) secretSet(c *gin.Context) {
+	var body struct {
+		Name  string `json:"name" binding:"required"`
+		Value string `json:"value" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "name and value required"})
+		return
+	}
+	if !validSecretName(body.Name) {
+		c.JSON(400, gin.H{"error": "name must be UPPER_SNAKE (A-Z 0-9 _)"})
+		return
+	}
+	if err := s.secrets.Set(body.Name, body.Value); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"name": body.Name, "ok": true})
+}
+
+func (s *Server) secretDelete(c *gin.Context) {
+	if err := s.secrets.Delete(c.Param("name")); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(204)
+}
+
+// keyList returns every provider-key reference, combining the DB secret store
+// and the api_key_ref values used by models — each tagged with where it
+// actually resolves from (db | env | missing) and a masked preview.
+func (s *Server) keyList(c *gin.Context) {
+	dbItems, _ := s.secrets.List()
+	inDB := map[string]string{}
+	for _, it := range dbItems {
+		inDB[it.Name] = it.Preview
+	}
+
+	usedBy := map[string]int{}
+	order := []string{}
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		order = append(order, name)
+	}
+
+	ms, _ := s.repo.List()
+	for _, m := range ms {
+		if m.APIKeyRef != "" {
+			usedBy[m.APIKeyRef]++
+		}
+		add(m.APIKeyRef)
+	}
+	for _, it := range dbItems {
+		add(it.Name)
+	}
+
+	out := make([]gin.H, 0, len(order))
+	for _, name := range order {
+		source, preview := "missing", ""
+		if p, ok := inDB[name]; ok {
+			source, preview = "db", p
+		} else if v := os.Getenv(name); v != "" {
+			source, preview = "env", maskKey(v)
+		}
+		out = append(out, gin.H{"name": name, "source": source, "preview": preview, "used_by": usedBy[name]})
+	}
+	c.JSON(200, out)
+}
+
+func maskKey(v string) string {
+	if len(v) <= 6 {
+		return "••••"
+	}
+	return v[:4] + "…" + v[len(v)-2:]
+}
+
+func validSecretName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') {
+			return false
+		}
+	}
+	return true
 }
