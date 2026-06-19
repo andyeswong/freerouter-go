@@ -92,6 +92,7 @@ func (s *Server) chat(c *gin.Context) {
 		SystemPrompt: system,
 		MaxTokens:    req.MaxTokens,
 		ContextChars: ctxChars,
+		HasTools:     req.HasTools(),
 		Tier:         models.Tier(req.Tier),
 		RequiresMCP:  req.RequiresMCP,
 	})

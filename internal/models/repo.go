@@ -14,6 +14,7 @@ func (r *Repo) AutoMigrate() error { return r.db.AutoMigrate(&LlmModel{}) }
 type CandidateQuery struct {
 	Tier         Tier // minimum capability the request needs
 	RequiresMCP  bool // true only when the task needs an agentic/MCP-native model
+	HasTools     bool // request carries function-calling tools → only ToolsOK models
 	ContextChars int  // total chars across ALL messages; 0 = skip context filter
 	MaxOutput    int  // tokens to reserve for the completion
 	Margin       float64 // safety multiplier on estimated input tokens (default 1.2)
@@ -38,6 +39,10 @@ func (r *Repo) CandidatesFor(q CandidateQuery) ([]LlmModel, error) {
 
 	if q.RequiresMCP {
 		tx = tx.Where("mcp_native = ?", true)
+	}
+	if q.HasTools {
+		// Exclude models that break stateless function-calling clients.
+		tx = tx.Where("tools_ok = ?", true)
 	}
 	if q.ContextChars > 0 {
 		margin := q.Margin

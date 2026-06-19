@@ -12,7 +12,8 @@ type Request struct {
 	Prompt       string
 	SystemPrompt string
 	MaxTokens    int
-	ContextChars int // total chars across ALL messages (for context sizing); 0 = derive from prompt+system
+	ContextChars int  // total chars across ALL messages (for context sizing); 0 = derive from prompt+system
+	HasTools     bool // request carries function-calling tools → only ToolsOK models
 
 	// Optional declared metadata (data-driven path, preferred over heuristics).
 	Tier         models.Tier // 0 = let the classifier decide
@@ -82,6 +83,7 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 	cands, err := rt.repo.CandidatesFor(models.CandidateQuery{
 		Tier:         tier,
 		RequiresMCP:  requiresMCP,
+		HasTools:     req.HasTools,
 		ContextChars: ctxChars,
 		MaxOutput:    req.MaxTokens,
 		Margin:       1.2,

@@ -34,6 +34,14 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 	}
 	m.Role = raw.Role
 
+	// Missing or explicit-null content (e.g. an assistant message that carries
+	// only tool_calls). Treat as empty — do NOT error. (Crush/OpenAI clients
+	// send assistant tool-call turns with no content field.)
+	if len(raw.Content) == 0 || string(raw.Content) == "null" {
+		m.Content = ""
+		return nil
+	}
+
 	// Try string first.
 	var s string
 	if err := json.Unmarshal(raw.Content, &s); err == nil {
@@ -62,14 +70,29 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 // The full original body is proxied verbatim except `model`, which is rewritten
 // to the chosen upstream model id.
 type ChatRequest struct {
-	Model     string    `json:"model"`
-	Messages  []Message `json:"messages"`
-	MaxTokens int       `json:"max_tokens"`
-	Stream    bool      `json:"stream"`
+	Model     string          `json:"model"`
+	Messages  []Message       `json:"messages"`
+	MaxTokens int             `json:"max_tokens"`
+	Stream    bool            `json:"stream"`
+	Tools     json.RawMessage `json:"tools,omitempty"` // function-calling tool defs (presence steers routing)
 
 	// FreeRouter extensions (optional, ignored by upstream after stripping).
 	Tier        int   `json:"tier,omitempty"`
 	RequiresMCP *bool `json:"requires_mcp,omitempty"`
+}
+
+// HasTools reports whether this is a function-calling conversation — either the
+// request declares tools, or the history contains a tool result / tool-call turn.
+func (r ChatRequest) HasTools() bool {
+	if len(r.Tools) > 0 && string(r.Tools) != "null" && string(r.Tools) != "[]" {
+		return true
+	}
+	for _, m := range r.Messages {
+		if m.Role == "tool" {
+			return true
+		}
+	}
+	return false
 }
 
 var httpClient = &http.Client{Timeout: 300 * time.Second}

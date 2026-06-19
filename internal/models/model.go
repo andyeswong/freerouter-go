@@ -71,6 +71,13 @@ type LlmModel struct {
 	// tool call to the parent harness instead. See cc_bridge no_exec mode.
 	ForceNoExec bool `json:"force_no_exec"`
 
+	// ToolsOK = the model plays nicely with stateless OpenAI function-calling
+	// clients. Set false for models whose API breaks such clients (e.g. DeepSeek
+	// v4 thinking mode requires reasoning_content to be round-tripped, which
+	// clients like Charm Crush / OpenCode don't preserve). Requests that carry
+	// tools are routed only to ToolsOK models. Default true.
+	ToolsOK bool `gorm:"default:true" json:"tools_ok"`
+
 	Enabled bool   `gorm:"index" json:"enabled"`
 	Health  Health `gorm:"default:unknown" json:"health"`
 	LatencyP50Ms int `json:"latency_p50_ms"`
