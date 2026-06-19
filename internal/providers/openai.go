@@ -92,6 +92,15 @@ func Proxy(m models.LlmModel, rawBody []byte) (*http.Response, error) {
 	delete(body, "tier")
 	delete(body, "requires_mcp")
 
+	// Inject the model's custom system prompt at the front of the messages, so
+	// it steers every request routed to this model.
+	if m.CustomSystemPrompt != "" {
+		if msgs, ok := body["messages"].([]any); ok {
+			sys := map[string]any{"role": "system", "content": m.CustomSystemPrompt}
+			body["messages"] = append([]any{sys}, msgs...)
+		}
+	}
+
 	// Ask the upstream to include token usage in the final stream chunk so we
 	// can bill streamed requests too (OpenAI-compatible stream_options).
 	if s, _ := body["stream"].(bool); s {

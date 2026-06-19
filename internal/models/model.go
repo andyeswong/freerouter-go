@@ -61,6 +61,11 @@ type LlmModel struct {
 	Weight    int  `json:"weight"`              // tie-breaker, higher = preferred
 	McpNative bool `gorm:"index" json:"mcp_native"`
 
+	// CustomSystemPrompt, if set, is injected as a system message at the front
+	// of every request routed to this model — per-model behavior steering
+	// (e.g. "do not execute tools, return the command instead").
+	CustomSystemPrompt string `json:"custom_system_prompt"`
+
 	Enabled bool   `gorm:"index" json:"enabled"`
 	Health  Health `gorm:"default:unknown" json:"health"`
 	LatencyP50Ms int `json:"latency_p50_ms"`
