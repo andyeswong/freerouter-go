@@ -101,6 +101,12 @@ func Proxy(m models.LlmModel, rawBody []byte) (*http.Response, error) {
 		}
 	}
 
+	// Force plan-only mode (cc_bridge no_exec): return tool_calls to the parent
+	// harness instead of executing. Travels in the body so it reaches cc_bridge.
+	if m.ForceNoExec {
+		body["no_exec"] = true
+	}
+
 	// Ask the upstream to include token usage in the final stream chunk so we
 	// can bill streamed requests too (OpenAI-compatible stream_options).
 	if s, _ := body["stream"].(bool); s {

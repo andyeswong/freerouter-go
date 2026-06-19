@@ -66,6 +66,11 @@ type LlmModel struct {
 	// (e.g. "do not execute tools, return the command instead").
 	CustomSystemPrompt string `json:"custom_system_prompt"`
 
+	// ForceNoExec injects "no_exec":true into every request to this model. For
+	// cc_bridge-backed Claude models it means: don't execute tools, return the
+	// tool call to the parent harness instead. See cc_bridge no_exec mode.
+	ForceNoExec bool `json:"force_no_exec"`
+
 	Enabled bool   `gorm:"index" json:"enabled"`
 	Health  Health `gorm:"default:unknown" json:"health"`
 	LatencyP50Ms int `json:"latency_p50_ms"`
