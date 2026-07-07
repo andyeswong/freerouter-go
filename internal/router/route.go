@@ -35,6 +35,15 @@ type Decision struct {
 
 var ErrNoCandidate = errors.New("no eligible model for request")
 
+// MaxOutputClamp caps the caller-supplied max_output used for the context-fit
+// check in CandidatesFor. No real model streams hundreds of thousands of output
+// tokens; some clients (e.g. Coder's aibridge) reserve a huge output budget
+// derived from a 1M context_limit, which — added to a large input — wrongly
+// pushes even 1M-window models past the context filter, yielding a spurious
+// "no eligible model". Clamping only affects ROUTING eligibility; the untouched
+// request body (with the caller's original max_tokens) is still relayed upstream.
+var MaxOutputClamp = 131072
+
 // Router ties the classifier to the vademécum.
 type Router struct {
 	repo *models.Repo
@@ -80,12 +89,18 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 		ctxChars = len(req.SystemPrompt) + len(req.Prompt)
 	}
 
+	// Clamp an unrealistic caller max_output for the context-fit check only.
+	maxOut := req.MaxTokens
+	if maxOut > MaxOutputClamp {
+		maxOut = MaxOutputClamp
+	}
+
 	cands, err := rt.repo.CandidatesFor(models.CandidateQuery{
 		Tier:         tier,
 		RequiresMCP:  requiresMCP,
 		HasTools:     req.HasTools,
 		ContextChars: ctxChars,
-		MaxOutput:    req.MaxTokens,
+		MaxOutput:    maxOut,
 		Margin:       1.2,
 	})
 	if err != nil {
