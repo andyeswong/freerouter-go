@@ -17,7 +17,7 @@ drop-in idea come from there. FreeRouter itself is forked from **ClawRouter**.
 
 It is **not a 1:1 port**. Two concrete bugs in the original were fixed here, and
 the routing model was changed to match how my own
-[Pillbox](https://github.com/andyeswong/pillbox) agent system already routes:
+Pillbox agent system already routes:
 
 | Original (freerouter, TS)                                   | FreeRouter-Go                                                          |
 |-------------------------------------------------------------|-----------------------------------------------------------------------|
@@ -70,6 +70,10 @@ OpenAI-compatible surface + a small admin API for the vademécum.
 | POST   | `/admin/tokens/:id/enable` | re-enable a token                                  |
 | GET    | `/admin/usage`             | usage aggregated by user+model (`?user=&model=&from=&to=`) |
 | GET    | `/admin/usage/recent`      | raw usage records (`?limit=`)                      |
+| GET    | `/admin/secrets`           | list stored provider secrets (masked: name, preview, updated_at) |
+| POST   | `/admin/secrets`           | set/rotate a secret `{"name":"DEEPSEEK_KEY","value":"sk-…"}` |
+| DELETE | `/admin/secrets/:name`     | remove a stored secret                             |
+| GET    | `/admin/keys`              | list the API-key refs models use, and whether each resolves |
 
 Every `/v1/chat/completions` response carries the routing decision in headers:
 `X-FreeRouter-Model`, `X-FreeRouter-Tier`, `X-FreeRouter-Savings`.
@@ -89,6 +93,16 @@ once at issue time.
 
 Query "who used how many tokens of which model": `GET /admin/usage` returns
 buckets grouped by `user` + `model`.
+
+### Provider keys
+
+Each model references its upstream key by name (`api_key_ref`). A ref resolves
+from the **DB secret store first** (`POST /admin/secrets`), then falls back to an
+**environment variable** of the same name — so you can add or rotate provider
+keys through the API (or dashboard) without editing the VM's `.env` or
+restarting. `GET /admin/keys` shows which refs the models need and whether each
+one currently resolves. Secret values are stored server-side and never returned
+(listings are masked to a short preview).
 
 ### Caller hints (data-driven path)
 
