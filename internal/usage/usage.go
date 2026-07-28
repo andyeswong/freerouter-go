@@ -88,10 +88,15 @@ func (r *Repo) Aggregate(f Filter) ([]Bucket, error) {
 // SumTokensSince totals one token's consumption from `since` onward. This is
 // the authoritative number the quota tracker hydrates its in-memory counters
 // from (at startup and on every calendar-window rollover).
+//
+// `since` is normalized to UTC before it is bound: created_at is stored in UTC,
+// and the sqlite driver drops the zone when serializing a zoned time, so a
+// cutoff like "00:00 -07:00" would otherwise compare as 00:00 UTC and shift the
+// whole window by the zone's offset.
 func (r *Repo) SumTokensSince(tokenID uint, since time.Time) (int64, error) {
 	var row struct{ Total int64 }
 	err := r.db.Model(&Record{}).
-		Where("token_id = ? AND created_at >= ?", tokenID, since).
+		Where("token_id = ? AND created_at >= ?", tokenID, since.UTC()).
 		Select("COALESCE(SUM(total_tokens),0) as total").
 		Scan(&row).Error
 	return row.Total, err
