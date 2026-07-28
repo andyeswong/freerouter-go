@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"os"
 	"strconv"
 	"time"
@@ -36,6 +37,22 @@ func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usa
 func (s *Server) Engine() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
+	// Minimal access log: gin.New() ships with none, so a fast-failing request
+	// (e.g. a proxy error returned before any slow/erroring DB query) left zero
+	// trace anywhere. This makes every request's outcome visible.
+	r.Use(func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		who := "-"
+		if tok, ok := auth.TokenFromCtx(c); ok {
+			who = tok.Name
+		}
+		if len(c.Errors) > 0 {
+			log.Printf("%s %s status=%d dur=%s token=%s err=%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start), who, c.Errors.String())
+		} else {
+			log.Printf("%s %s status=%d dur=%s token=%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start), who)
+		}
+	})
 
 	r.GET("/health", func(c *gin.Context) { c.JSON(200, gin.H{"status": "ok"}) })
 
@@ -122,7 +139,13 @@ func (s *Server) chat(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, io.TeeReader(resp.Body, &buf))
 
 	if resp.StatusCode < 400 {
-		s.recordUsage(c, decision, buf.Bytes(), ctxChars)
+		if tok, ok := auth.TokenFromCtx(c); ok {
+			// Billing/calibration writes are not on the client's critical path
+			// (the response body is already fully relayed above) — run them
+			// off-request so a busy SQLite writer never stalls the next request's
+			// auth check behind this one's bookkeeping.
+			go s.recordUsage(tok, decision, buf.Bytes(), ctxChars)
+		}
 	}
 }
 
@@ -130,11 +153,7 @@ func (s *Server) chat(c *gin.Context) {
 // chars-per-token ratio (EMA), and writes a usage row. promptChars is the size
 // of the input (all messages) — used to estimate prompt tokens when the
 // provider doesn't report them (e.g. Ollama Cloud only returns completion).
-func (s *Server) recordUsage(c *gin.Context, d *router.Decision, body []byte, promptChars int) {
-	tok, ok := auth.TokenFromCtx(c)
-	if !ok {
-		return
-	}
+func (s *Server) recordUsage(tok *auth.ApiToken, d *router.Decision, body []byte, promptChars int) {
 	u := providers.ParseUsage(body)
 
 	estimated := false

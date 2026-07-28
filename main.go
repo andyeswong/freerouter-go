@@ -30,6 +30,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("db: %v", err)
 	}
+	// WAL lets readers (router candidate lookups, secret resolution) proceed
+	// without waiting on an in-flight writer. busy_timeout makes any remaining
+	// writer-vs-writer overlap wait instead of failing with SQLITE_BUSY.
+	// A single pooled connection means this process never contends with itself.
+	if err := db.Exec("PRAGMA journal_mode=WAL;").Error; err != nil {
+		log.Fatalf("db pragma journal_mode: %v", err)
+	}
+	if err := db.Exec("PRAGMA busy_timeout=5000;").Error; err != nil {
+		log.Fatalf("db pragma busy_timeout: %v", err)
+	}
+	if err := db.Exec("PRAGMA synchronous=NORMAL;").Error; err != nil {
+		log.Fatalf("db pragma synchronous: %v", err)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	} else {
+		log.Fatalf("db pool: %v", err)
+	}
 
 	repo := models.NewRepo(db)
 	tokens := auth.NewRepo(db)

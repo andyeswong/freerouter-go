@@ -58,15 +58,20 @@ func (r *Repo) Issue(name string) (*ApiToken, string, error) {
 	return tok, plain, nil
 }
 
-// Verify resolves a plaintext bearer to an enabled token, touching last_used_at.
+// Verify resolves a plaintext bearer to an enabled token. last_used_at is
+// touched asynchronously — a busy writer elsewhere (e.g. another dev's usage
+// insert) must never make an unrelated request wait on this bookkeeping write.
 func (r *Repo) Verify(plain string) (*ApiToken, bool) {
 	var tok ApiToken
 	err := r.db.Where("token_hash = ? AND enabled = ?", hashToken(plain), true).First(&tok).Error
 	if err != nil {
 		return nil, false
 	}
-	now := time.Now()
-	r.db.Model(&tok).Update("last_used_at", &now)
+	id := tok.ID
+	go func() {
+		now := time.Now()
+		r.db.Model(&ApiToken{}).Where("id = ?", id).Update("last_used_at", &now)
+	}()
 	return &tok, true
 }
 
