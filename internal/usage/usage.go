@@ -30,7 +30,26 @@ type Repo struct{ db *gorm.DB }
 
 func NewRepo(db *gorm.DB) *Repo { return &Repo{db: db} }
 
-func (r *Repo) AutoMigrate() error { return r.db.AutoMigrate(&Record{}) }
+func (r *Repo) AutoMigrate() error {
+	if err := r.db.AutoMigrate(&Record{}); err != nil {
+		return err
+	}
+	// Covering index for Aggregate's GROUP BY user, model. Without it that query
+	// scans and sorts every row — measured at ~230ms in production, logged as
+	// SLOW SQL once a minute — and because the pool is a SINGLE connection, those
+	// milliseconds serialize everything, including the auth lookup of an incoming
+	// chat. Same shape of problem as the write contention behind the 502s.
+	// Every summed column is in the index, so the query never touches the table.
+	if err := r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_records_usage_agg
+		ON records(user, model, total_tokens, prompt_tokens, completion_tokens, cost_estimate)`).Error; err != nil {
+		return err
+	}
+	// Same idea for Series. It helps less (measured 38ms -> 31ms on 50k rows)
+	// because that query's cost is the per-row strftime and the sort, not table
+	// lookups — which is why the handler also caches. Kept because it is free.
+	return r.db.Exec(`CREATE INDEX IF NOT EXISTS idx_records_series
+		ON records(created_at, user, total_tokens, prompt_tokens, completion_tokens, cost_estimate)`).Error
+}
 
 func (r *Repo) Add(rec *Record) error { return r.db.Create(rec).Error }
 

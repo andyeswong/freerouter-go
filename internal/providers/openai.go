@@ -115,12 +115,77 @@ func (r ChatRequest) RequiresJSONSchema() bool {
 	return rf.Type == "json_schema"
 }
 
+// schemaInstruction turns a json_schema response_format into a prompt the model
+// can actually obey. Measured 2026-07-28 against every provider in the
+// vademécum: DeepSeek answers 400 "This response_format type is unavailable
+// now", while Ollama Cloud and cc_bridge answer 200 and IGNORE the field —
+// returning prose where the caller expects an object, which is worse than an
+// error. None of them implement it. Asked in the prompt, though, they comply.
+func schemaInstruction(responseFormat json.RawMessage) string {
+	var rf struct {
+		JSONSchema struct {
+			Name   string          `json:"name"`
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	}
+	if json.Unmarshal(responseFormat, &rf) != nil || len(rf.JSONSchema.Schema) == 0 {
+		return "Respond with a single valid JSON object and nothing else. No markdown, no code fences, no prose."
+	}
+	name := rf.JSONSchema.Name
+	if name == "" {
+		name = "result"
+	}
+	return "Your entire response must be a single valid JSON object matching this JSON Schema" +
+		" (named \"" + name + "\"):\n" + string(rf.JSONSchema.Schema) +
+		"\nOutput ONLY that JSON object: no markdown, no code fences, no explanation, no text before or after."
+}
+
+// ExtractJSON pulls the first balanced JSON object out of a model's answer, so
+// a stray code fence or a sentence of preamble doesn't break a caller that is
+// about to json.Parse the content. Brace counting ignores braces inside string
+// literals and honors escapes. Returns false when there is no object to find.
+func ExtractJSON(s string) (string, bool) {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return "", false
+	}
+	depth, inStr, esc := 0, false, false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case esc:
+			esc = false
+		case c == '\\' && inStr:
+			esc = true
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+			// literal content, nothing to count
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1], true
+			}
+		}
+	}
+	return "", false // unterminated (e.g. the answer hit max_tokens)
+}
+
 var httpClient = &http.Client{Timeout: 300 * time.Second}
 
 // KeyResolver maps a model's api_key_ref to the actual key. Defaults to env
 // lookup; main wires it to check the DB secret store first, then env, so keys
 // can be added/rotated at runtime without a restart.
 var KeyResolver = func(ref string) string { return os.Getenv(ref) }
+
+// EmulatesJSONSchema reports whether a json_schema request to this model has to
+// be served by instruction instead of natively. Handlers use it to decide
+// whether the answer needs the JSON extracted before it reaches the caller.
+func EmulatesJSONSchema(m models.LlmModel, req ChatRequest) bool {
+	return req.RequiresJSONSchema() && !m.JSONSchemaOK
+}
 
 // Proxy forwards rawBody to the model's endpoint, rewriting the model id and
 // injecting the API key resolved from the model's APIKeyRef env var. Returns
@@ -134,6 +199,22 @@ func Proxy(m models.LlmModel, rawBody []byte) (*http.Response, error) {
 	body["model"] = m.ModelID
 	delete(body, "tier")
 	delete(body, "requires_mcp")
+
+	// Structured output for a model that doesn't implement it: carry the schema
+	// as an instruction and drop the field, which would otherwise earn a 400
+	// from DeepSeek or be silently ignored elsewhere. Appended LAST for recency,
+	// the same reason cc_bridge puts its router directive at the end.
+	if rf, ok := body["response_format"].(map[string]any); ok && !m.JSONSchemaOK {
+		if t, _ := rf["type"].(string); t == "json_schema" {
+			raw, _ := json.Marshal(rf)
+			delete(body, "response_format")
+			if msgs, ok := body["messages"].([]any); ok {
+				body["messages"] = append(msgs, map[string]any{
+					"role": "system", "content": schemaInstruction(raw),
+				})
+			}
+		}
+	}
 
 	// Inject the model's custom system prompt at the front of the messages, so
 	// it steers every request routed to this model.

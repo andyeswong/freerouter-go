@@ -47,8 +47,15 @@ func (r *Repo) CandidatesFor(q CandidateQuery) ([]LlmModel, error) {
 		tx = tx.Where("tools_ok = ?", true)
 	}
 	if q.RequiresJSONSchema {
-		// Only models that actually implement strict structured output.
-		tx = tx.Where("json_schema_ok = ?", true)
+		// NOT a hard filter on json_schema_ok: measured 2026-07-28, no provider
+		// in the vademécum implements response_format=json_schema (DeepSeek 400s,
+		// Ollama Cloud and cc_bridge accept it and ignore it), so the proxy
+		// emulates it by instruction. What that emulation needs is a model whose
+		// answer is the answer — exactly the property tools_ok already tracks,
+		// since it is false for models whose thinking mode returns content in a
+		// shape stateless clients can't use. A natively capable model, if one
+		// ever exists, is preferred by the ORDER below.
+		tx = tx.Where("tools_ok = ?", true)
 	}
 	if q.ContextChars > 0 {
 		margin := q.Margin
@@ -62,8 +69,14 @@ func (r *Repo) CandidatesFor(q CandidateQuery) ([]LlmModel, error) {
 			q.ContextChars, margin, q.MaxOutput)
 	}
 
+	order := "tier_max ASC, cost ASC, weight DESC"
+	if q.RequiresJSONSchema {
+		// Prefer a natively capable model over one that has to be instructed.
+		order = "json_schema_ok DESC, " + order
+	}
+
 	var out []LlmModel
-	err := tx.Order("tier_max ASC, cost ASC, weight DESC").Find(&out).Error
+	err := tx.Order(order).Find(&out).Error
 	return out, err
 }
 

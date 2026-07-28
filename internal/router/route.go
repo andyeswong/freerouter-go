@@ -36,10 +36,10 @@ type Decision struct {
 
 var ErrNoCandidate = errors.New("no eligible model for request")
 
-// ErrNoJSONSchemaModel distinguishes the structured-output dead end from a
-// generic no-candidate result: the fix is to enable/mark a capable model, not
-// to shrink the request.
-var ErrNoJSONSchemaModel = errors.New("no eligible model supports response_format=json_schema (mark a capable model json_schema_ok)")
+// ErrNoJSONSchemaModel names the structured-output case specifically: the
+// schema is emulated by instruction, which needs a model that answers plainly
+// (tools_ok), so the fix is to enable one — not to shrink the request.
+var ErrNoJSONSchemaModel = errors.New("no eligible model can serve a json_schema request (needs an enabled tools_ok model)")
 
 // MaxOutputClamp caps the caller-supplied max_output used for the context-fit
 // check in CandidatesFor. No real model streams hundreds of thousands of output

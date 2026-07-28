@@ -46,12 +46,18 @@ func (r *Repo) Set(name, value string) error {
 }
 
 // Get returns the value and whether it exists.
+//
+// Find, not First: a miss here is the NORMAL case for a key that lives in the
+// .env (KeyResolver checks the DB first, then falls back), and First treats a
+// miss as ErrRecordNotFound, which GORM logs as an error. That printed a bogus
+// "record not found" line on every single request to such a model — thousands
+// of them for the most-used model in the vademécum.
 func (r *Repo) Get(name string) (string, bool) {
-	var s Secret
-	if r.db.Where("name = ?", name).First(&s).Error != nil {
+	var rows []Secret
+	if r.db.Where("name = ?", name).Limit(1).Find(&rows).Error != nil || len(rows) == 0 {
 		return "", false
 	}
-	return s.Value, true
+	return rows[0].Value, true
 }
 
 func (r *Repo) List() ([]Info, error) {

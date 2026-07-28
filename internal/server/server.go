@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -30,6 +31,9 @@ type Server struct {
 	secrets    *secrets.Repo
 	quota      *quota.Tracker
 	adminToken string
+
+	seriesMu    sync.Mutex
+	seriesCache map[string]seriesEntry
 }
 
 func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, secretsRepo *secrets.Repo, quotaTracker *quota.Tracker, adminToken string) *Server {
@@ -141,6 +145,24 @@ func (s *Server) chat(c *gin.Context) {
 		c.Header("Content-Type", ct)
 	}
 
+	// A schema served by instruction (see providers.EmulatesJSONSchema) can come
+	// back wrapped in a fence or a sentence of preamble. The caller is about to
+	// parse it, so tighten it to the JSON object here — only on the non-streaming
+	// path, which is the one that was failing; a stream is relayed untouched.
+	if providers.EmulatesJSONSchema(decision.Model, req) && !req.Stream && resp.StatusCode < 400 {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr == nil {
+			out := tightenToJSON(body)
+			c.Header("X-FreeRouter-JSONSchema", "emulated")
+			_, _ = c.Writer.Write(out)
+			if tok, ok := auth.TokenFromCtx(c); ok {
+				go s.recordUsage(tok, decision, out, ctxChars)
+			}
+			return
+		}
+		// Couldn't read it: fall through and relay whatever is left.
+	}
+
 	// Tee: relay to the client while capturing the full body for usage billing.
 	var buf bytes.Buffer
 	_, _ = io.Copy(c.Writer, io.TeeReader(resp.Body, &buf))
@@ -154,6 +176,48 @@ func (s *Server) chat(c *gin.Context) {
 			go s.recordUsage(tok, decision, buf.Bytes(), ctxChars)
 		}
 	}
+}
+
+// tightenToJSON rewrites a completion's message content down to the JSON object
+// it contains. Returns the body untouched whenever anything is not as expected
+// (not a completion, no object found, …) — a best-effort cleanup must never turn
+// a usable answer into a broken one.
+func tightenToJSON(body []byte) []byte {
+	var doc map[string]any
+	if json.Unmarshal(body, &doc) != nil {
+		return body
+	}
+	choices, ok := doc["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return body
+	}
+	changed := false
+	for _, ch := range choices {
+		choice, ok := ch.(map[string]any)
+		if !ok {
+			continue
+		}
+		msg, ok := choice["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"].(string)
+		if !ok || content == "" {
+			continue
+		}
+		if extracted, found := providers.ExtractJSON(content); found && extracted != content {
+			msg["content"] = extracted
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // recordUsage parses upstream token counts, calibrates the model's
@@ -435,17 +499,51 @@ func (s *Server) usageReport(c *gin.Context) {
 // the dashboard's trends and per-user daily averages are computed from.
 // Buckets are labeled in the quota timezone so a "day" here is the same day a
 // quota window uses.
+// seriesTTL caches the aggregation briefly. The query is O(all history) — it
+// groups by a per-row strftime, which no index can satisfy — and it measured
+// 333ms in production. With a single pooled connection those milliseconds
+// serialize every other request, including an incoming chat's auth lookup, so a
+// dashboard polling every 15s must not translate into a slow query every 15s.
+// Usage figures tolerate being a minute stale; the router stalling does not.
+const seriesTTL = 60 * time.Second
+
+type seriesEntry struct {
+	at   time.Time
+	body gin.H
+}
+
 func (s *Server) usageSeries(c *gin.Context) {
 	loc := time.UTC
 	if s.quota != nil {
 		loc = s.quota.Location()
 	}
+
+	key := c.Request.URL.RawQuery
+	s.seriesMu.Lock()
+	if e, ok := s.seriesCache[key]; ok && time.Since(e.at) < seriesTTL {
+		s.seriesMu.Unlock()
+		c.Header("X-FreeRouter-Cache", "hit")
+		c.JSON(200, e.body)
+		return
+	}
+	s.seriesMu.Unlock()
+
 	points, err := s.usage.Series(s.usageFilter(c), c.Query("bucket"), c.Query("group"), loc)
 	if err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, gin.H{"points": points, "timezone": loc.String()})
+	body := gin.H{"points": points, "timezone": loc.String()}
+
+	s.seriesMu.Lock()
+	if s.seriesCache == nil {
+		s.seriesCache = map[string]seriesEntry{}
+	}
+	s.seriesCache[key] = seriesEntry{at: time.Now(), body: body}
+	s.seriesMu.Unlock()
+
+	c.Header("X-FreeRouter-Cache", "miss")
+	c.JSON(200, body)
 }
 
 func (s *Server) usageRecent(c *gin.Context) {
