@@ -16,6 +16,7 @@ import (
 	"github.com/andyeswong/freerouter-go/internal/auth"
 	"github.com/andyeswong/freerouter-go/internal/models"
 	"github.com/andyeswong/freerouter-go/internal/providers"
+	"github.com/andyeswong/freerouter-go/internal/quota"
 	"github.com/andyeswong/freerouter-go/internal/router"
 	"github.com/andyeswong/freerouter-go/internal/secrets"
 	"github.com/andyeswong/freerouter-go/internal/usage"
@@ -27,11 +28,12 @@ type Server struct {
 	tokens     *auth.Repo
 	usage      *usage.Repo
 	secrets    *secrets.Repo
+	quota      *quota.Tracker
 	adminToken string
 }
 
-func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, secretsRepo *secrets.Repo, adminToken string) *Server {
-	return &Server{repo: repo, rt: rt, tokens: tokens, usage: usageRepo, secrets: secretsRepo, adminToken: adminToken}
+func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, secretsRepo *secrets.Repo, quotaTracker *quota.Tracker, adminToken string) *Server {
+	return &Server{repo: repo, rt: rt, tokens: tokens, usage: usageRepo, secrets: secretsRepo, quota: quotaTracker, adminToken: adminToken}
 }
 
 func (s *Server) Engine() *gin.Engine {
@@ -60,7 +62,9 @@ func (s *Server) Engine() *gin.Engine {
 	v1 := r.Group("/v1", s.tokens.RequireToken())
 	{
 		v1.GET("/models", s.listModelsOpenAI)
-		v1.POST("/chat/completions", s.chat)
+		// Quota only gates the endpoint that actually spends tokens; listing
+		// models must keep working for a client that is over budget.
+		v1.POST("/chat/completions", quota.Enforce(s.quota), s.chat)
 	}
 
 	// Admin surface — gated by the static admin token.
@@ -76,6 +80,7 @@ func (s *Server) Engine() *gin.Engine {
 		admin.POST("/tokens", s.tokenIssue)
 		admin.POST("/tokens/:id/revoke", s.tokenRevoke)
 		admin.POST("/tokens/:id/enable", s.tokenEnable)
+		admin.PUT("/tokens/:id/limits", s.tokenSetLimits)
 
 		admin.GET("/usage", s.usageReport)
 		admin.GET("/usage/recent", s.usageRecent)
@@ -105,13 +110,14 @@ func (s *Server) chat(c *gin.Context) {
 	user, system := providers.ExtractPrompt(req.Messages)
 	ctxChars := providers.ContextChars(req.Messages)
 	decision, err := s.rt.Route(router.Request{
-		Prompt:       user,
-		SystemPrompt: system,
-		MaxTokens:    req.MaxTokens,
-		ContextChars: ctxChars,
-		HasTools:     req.HasTools(),
-		Tier:         models.Tier(req.Tier),
-		RequiresMCP:  req.RequiresMCP,
+		Prompt:             user,
+		SystemPrompt:       system,
+		MaxTokens:          req.MaxTokens,
+		ContextChars:       ctxChars,
+		HasTools:           req.HasTools(),
+		RequiresJSONSchema: req.RequiresJSONSchema(),
+		Tier:               models.Tier(req.Tier),
+		RequiresMCP:        req.RequiresMCP,
 	})
 	if err != nil {
 		c.JSON(503, gin.H{"error": err.Error()})
@@ -176,6 +182,13 @@ func (s *Server) recordUsage(tok *auth.ApiToken, d *router.Decision, body []byte
 
 	cost := float64(u.PromptTokens)/1e6*d.Model.InputPrice +
 		float64(u.CompletionTokens)/1e6*d.Model.OutputPrice
+
+	// Book the spend against the live quota counters BEFORE the row lands in
+	// SQLite: a hydration racing this Add can then only miss an in-flight row,
+	// never count it twice (see quota.Tracker.Add).
+	if s.quota != nil {
+		s.quota.Add(tok.ID, int64(u.TotalTokens))
+	}
 
 	_ = s.usage.Add(&usage.Record{
 		TokenID:          tok.ID,
@@ -280,13 +293,67 @@ func (s *Server) adminScan(c *gin.Context) {
 
 // ---- admin: tokens ----
 
+// tokenWithQuota is a token row plus its live per-window consumption, so the
+// dashboard can render "used / limit" without a second round trip.
+type tokenWithQuota struct {
+	auth.ApiToken
+	Quota []quota.WindowState `json:"quota"`
+}
+
 func (s *Server) tokenList(c *gin.Context) {
 	ts, err := s.tokens.List()
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(200, ts)
+	out := make([]tokenWithQuota, 0, len(ts))
+	for i := range ts {
+		row := tokenWithQuota{ApiToken: ts[i]}
+		if s.quota != nil {
+			row.Quota = s.quota.Snapshot(ts[i].ID, quota.LimitsOf(&ts[i]))
+		}
+		out = append(out, row)
+	}
+	c.JSON(200, out)
+}
+
+// tokenSetLimits updates a token's ceilings. Omitted fields keep their current
+// value; an explicit 0 clears that window's limit (unlimited).
+func (s *Server) tokenSetLimits(c *gin.Context) {
+	id, _ := strconv.Atoi(c.Param("id"))
+	var body struct {
+		Daily   *int64 `json:"limit_daily_tokens"`
+		Weekly  *int64 `json:"limit_weekly_tokens"`
+		Monthly *int64 `json:"limit_monthly_tokens"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	for _, v := range []*int64{body.Daily, body.Weekly, body.Monthly} {
+		if v != nil && *v < 0 {
+			c.JSON(400, gin.H{"error": "limits must be >= 0 (0 = unlimited)"})
+			return
+		}
+	}
+	if err := s.tokens.SetLimits(uint(id), body.Daily, body.Weekly, body.Monthly); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	tok, err := s.tokens.Get(uint(id))
+	if err != nil {
+		c.JSON(404, gin.H{"error": "not found"})
+		return
+	}
+	// Drop cached counters so the response reflects freshly-summed usage.
+	if s.quota != nil {
+		s.quota.Forget(tok.ID)
+	}
+	row := tokenWithQuota{ApiToken: *tok}
+	if s.quota != nil {
+		row.Quota = s.quota.Snapshot(tok.ID, quota.LimitsOf(tok))
+	}
+	c.JSON(200, row)
 }
 
 // tokenIssue creates a dev token. The plaintext is returned ONCE here.

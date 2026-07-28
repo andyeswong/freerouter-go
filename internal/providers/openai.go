@@ -76,6 +76,10 @@ type ChatRequest struct {
 	Stream    bool            `json:"stream"`
 	Tools     json.RawMessage `json:"tools,omitempty"` // function-calling tool defs (presence steers routing)
 
+	// ResponseFormat carries OpenAI structured-output requests. Only its "type"
+	// matters for routing; the field itself is proxied upstream untouched.
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+
 	// FreeRouter extensions (optional, ignored by upstream after stripping).
 	Tier        int   `json:"tier,omitempty"`
 	RequiresMCP *bool `json:"requires_mcp,omitempty"`
@@ -93,6 +97,22 @@ func (r ChatRequest) HasTools() bool {
 		}
 	}
 	return false
+}
+
+// RequiresJSONSchema reports whether the caller demands strict structured
+// output (response_format:{"type":"json_schema"}). Plain {"type":"json_object"}
+// is widely supported and deliberately does NOT narrow routing.
+func (r ChatRequest) RequiresJSONSchema() bool {
+	if len(r.ResponseFormat) == 0 || string(r.ResponseFormat) == "null" {
+		return false
+	}
+	var rf struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(r.ResponseFormat, &rf) != nil {
+		return false
+	}
+	return rf.Type == "json_schema"
 }
 
 var httpClient = &http.Client{Timeout: 300 * time.Second}

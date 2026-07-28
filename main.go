@@ -14,6 +14,7 @@ import (
 	"github.com/andyeswong/freerouter-go/internal/config"
 	"github.com/andyeswong/freerouter-go/internal/models"
 	"github.com/andyeswong/freerouter-go/internal/providers"
+	"github.com/andyeswong/freerouter-go/internal/quota"
 	"github.com/andyeswong/freerouter-go/internal/router"
 	"github.com/andyeswong/freerouter-go/internal/secrets"
 	"github.com/andyeswong/freerouter-go/internal/server"
@@ -71,10 +72,18 @@ func main() {
 		log.Print("WARNING: admin token unset — /admin/* is OPEN. Set FRGO_ADMIN_TOKEN.")
 	}
 
-	rt := router.New(repo, cfg.Heuristic)
-	srv := server.New(repo, rt, tokens, usageRepo, secretsRepo, cfg.AdminToken)
+	// Per-token consumption limits (opt-in, 0 = unlimited). Counters live in
+	// memory and hydrate from the usage table, so the hot path stays read-free.
+	loc, tzErr := cfg.QuotaLocation()
+	if tzErr != nil {
+		log.Printf("WARNING: quota timezone %q unavailable (%v) — falling back to UTC", cfg.QuotaTimezone, tzErr)
+	}
+	quotaTracker := quota.NewTracker(usageRepo, loc)
 
-	log.Printf("FreeRouter-Go listening on %s (db=%s)", cfg.Listen, cfg.DBPath)
+	rt := router.New(repo, cfg.Heuristic)
+	srv := server.New(repo, rt, tokens, usageRepo, secretsRepo, quotaTracker, cfg.AdminToken)
+
+	log.Printf("FreeRouter-Go listening on %s (db=%s, quota_tz=%s)", cfg.Listen, cfg.DBPath, loc)
 	if err := srv.Engine().Run(cfg.Listen); err != nil {
 		log.Fatal(err)
 	}

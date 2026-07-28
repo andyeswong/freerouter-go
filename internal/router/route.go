@@ -9,11 +9,12 @@ import (
 // Request is what the router needs to make a decision. Fields beyond Prompt are
 // optional caller hints — when present they override the heuristic classifier.
 type Request struct {
-	Prompt       string
-	SystemPrompt string
-	MaxTokens    int
-	ContextChars int  // total chars across ALL messages (for context sizing); 0 = derive from prompt+system
-	HasTools     bool // request carries function-calling tools → only ToolsOK models
+	Prompt             string
+	SystemPrompt       string
+	MaxTokens          int
+	ContextChars       int  // total chars across ALL messages (for context sizing); 0 = derive from prompt+system
+	HasTools           bool // request carries function-calling tools → only ToolsOK models
+	RequiresJSONSchema bool // response_format=json_schema → only JSONSchemaOK models
 
 	// Optional declared metadata (data-driven path, preferred over heuristics).
 	Tier         models.Tier // 0 = let the classifier decide
@@ -34,6 +35,11 @@ type Decision struct {
 }
 
 var ErrNoCandidate = errors.New("no eligible model for request")
+
+// ErrNoJSONSchemaModel distinguishes the structured-output dead end from a
+// generic no-candidate result: the fix is to enable/mark a capable model, not
+// to shrink the request.
+var ErrNoJSONSchemaModel = errors.New("no eligible model supports response_format=json_schema (mark a capable model json_schema_ok)")
 
 // MaxOutputClamp caps the caller-supplied max_output used for the context-fit
 // check in CandidatesFor. No real model streams hundreds of thousands of output
@@ -96,12 +102,13 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 	}
 
 	cands, err := rt.repo.CandidatesFor(models.CandidateQuery{
-		Tier:         tier,
-		RequiresMCP:  requiresMCP,
-		HasTools:     req.HasTools,
-		ContextChars: ctxChars,
-		MaxOutput:    maxOut,
-		Margin:       1.2,
+		Tier:               tier,
+		RequiresMCP:        requiresMCP,
+		HasTools:           req.HasTools,
+		RequiresJSONSchema: req.RequiresJSONSchema,
+		ContextChars:       ctxChars,
+		MaxOutput:          maxOut,
+		Margin:             1.2,
 	})
 	if err != nil {
 		return nil, err
@@ -119,6 +126,9 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 		pick = &cands[0]
 	}
 	if pick == nil {
+		if req.RequiresJSONSchema {
+			return nil, ErrNoJSONSchemaModel
+		}
 		return nil, ErrNoCandidate
 	}
 

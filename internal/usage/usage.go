@@ -85,6 +85,18 @@ func (r *Repo) Aggregate(f Filter) ([]Bucket, error) {
 	return out, err
 }
 
+// SumTokensSince totals one token's consumption from `since` onward. This is
+// the authoritative number the quota tracker hydrates its in-memory counters
+// from (at startup and on every calendar-window rollover).
+func (r *Repo) SumTokensSince(tokenID uint, since time.Time) (int64, error) {
+	var row struct{ Total int64 }
+	err := r.db.Model(&Record{}).
+		Where("token_id = ? AND created_at >= ?", tokenID, since).
+		Select("COALESCE(SUM(total_tokens),0) as total").
+		Scan(&row).Error
+	return row.Total, err
+}
+
 // Recent returns the latest raw records (for drill-down), capped by limit.
 func (r *Repo) Recent(f Filter, limit int) ([]Record, error) {
 	if limit <= 0 || limit > 500 {

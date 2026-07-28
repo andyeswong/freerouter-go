@@ -78,6 +78,15 @@ type LlmModel struct {
 	// tools are routed only to ToolsOK models. Default true.
 	ToolsOK bool `gorm:"default:true" json:"tools_ok"`
 
+	// JSONSchemaOK = the model accepts response_format:{"type":"json_schema"}
+	// (strict structured output). Most OpenAI-compatible providers we route to
+	// do NOT: DeepSeek/GLM/MiniMax reject it upstream with 400 "This
+	// response_format type is unavailable now". Default false, so a request
+	// demanding a JSON schema is only routed to models explicitly marked
+	// capable (e.g. real Claude via cc_bridge) instead of failing at the
+	// provider. Requests without response_format ignore this flag entirely.
+	JSONSchemaOK bool `gorm:"index;default:false" json:"json_schema_ok"`
+
 	Enabled bool   `gorm:"index" json:"enabled"`
 	Health  Health `gorm:"default:unknown" json:"health"`
 	LatencyP50Ms int `json:"latency_p50_ms"`

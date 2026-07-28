@@ -21,6 +21,14 @@ type ApiToken struct {
 	Enabled   bool       `gorm:"index" json:"enabled"`
 	LastUsedAt *time.Time `json:"last_used_at"`
 	CreatedAt time.Time  `json:"created_at"`
+
+	// Optional consumption ceilings, in TOTAL tokens (prompt + completion) per
+	// calendar window. 0 = unlimited, which is the default for every token.
+	// Enforced by internal/quota; windows reset on the calendar boundary in the
+	// configured timezone, not on a rolling basis.
+	LimitDailyTokens   int64 `gorm:"default:0" json:"limit_daily_tokens"`
+	LimitWeeklyTokens  int64 `gorm:"default:0" json:"limit_weekly_tokens"`
+	LimitMonthlyTokens int64 `gorm:"default:0" json:"limit_monthly_tokens"`
 }
 
 // hashToken returns the hex sha256 of a plaintext token.
@@ -83,4 +91,29 @@ func (r *Repo) List() ([]ApiToken, error) {
 // SetEnabled flips a token on/off (revoke = false).
 func (r *Repo) SetEnabled(id uint, enabled bool) error {
 	return r.db.Model(&ApiToken{}).Where("id = ?", id).Update("enabled", enabled).Error
+}
+
+// Get loads one token by id.
+func (r *Repo) Get(id uint) (*ApiToken, error) {
+	var tok ApiToken
+	return &tok, r.db.First(&tok, id).Error
+}
+
+// SetLimits updates the per-window token ceilings. A nil pointer leaves that
+// window untouched; 0 clears the limit (unlimited).
+func (r *Repo) SetLimits(id uint, daily, weekly, monthly *int64) error {
+	fields := map[string]any{}
+	if daily != nil {
+		fields["limit_daily_tokens"] = *daily
+	}
+	if weekly != nil {
+		fields["limit_weekly_tokens"] = *weekly
+	}
+	if monthly != nil {
+		fields["limit_monthly_tokens"] = *monthly
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return r.db.Model(&ApiToken{}).Where("id = ?", id).Updates(fields).Error
 }
