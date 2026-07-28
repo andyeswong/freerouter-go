@@ -3,6 +3,7 @@
 package usage
 
 import (
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -49,11 +50,13 @@ func (r *Repo) scope(f Filter) *gorm.DB {
 	if f.Model != "" {
 		tx = tx.Where("model = ?", f.Model)
 	}
+	// Bounds are normalized to UTC: created_at is stored in UTC and the driver
+	// drops the zone of a zoned parameter, which would shift the range.
 	if f.From != nil {
-		tx = tx.Where("created_at >= ?", *f.From)
+		tx = tx.Where("created_at >= ?", f.From.UTC())
 	}
 	if f.To != nil {
-		tx = tx.Where("created_at <= ?", *f.To)
+		tx = tx.Where("created_at <= ?", f.To.UTC())
 	}
 	return tx
 }
@@ -81,6 +84,71 @@ func (r *Repo) Aggregate(f Filter) ([]Bucket, error) {
 			COALESCE(SUM(cost_estimate),0) as cost_estimate`).
 		Group("user, model").
 		Order("total_tokens DESC").
+		Scan(&out).Error
+	return out, err
+}
+
+// SeriesPoint is one time bucket of usage, optionally split by user or model.
+type SeriesPoint struct {
+	Bucket string `json:"bucket"` // "2026-07-28" (day) or "2026-07-28T14" (hour), in the requested zone
+	Key    string `json:"key"`    // user or model when grouped; "" otherwise
+
+	Requests         int64   `json:"requests"`
+	PromptTokens     int64   `json:"prompt_tokens"`
+	CompletionTokens int64   `json:"completion_tokens"`
+	TotalTokens      int64   `json:"total_tokens"`
+	CostEstimate     float64 `json:"cost_estimate"`
+}
+
+// Series aggregates usage into calendar buckets, which the per-user/per-day
+// figures (averages, trends, peaks) are built from. Aggregating in SQL is the
+// point: the raw-record endpoint is capped, so anything longer than a couple of
+// hours cannot be derived client-side.
+//
+// Buckets are labeled in loc, using loc's CURRENT offset. Across a DST change
+// the boundary of older buckets can therefore be off by an hour — acceptable
+// for usage reporting, and the alternative (per-row zone math) is not something
+// SQLite can do without its own tz database.
+func (r *Repo) Series(f Filter, bucket, group string, loc *time.Location) ([]SeriesPoint, error) {
+	var stamp string
+	switch bucket {
+	case "", "day":
+		stamp = "%Y-%m-%d"
+	case "hour":
+		stamp = "%Y-%m-%dT%H"
+	default:
+		return nil, fmt.Errorf("unsupported bucket %q (day|hour)", bucket)
+	}
+
+	// Whitelisted: these are interpolated into SQL, never taken raw.
+	var keyExpr string
+	switch group {
+	case "", "none":
+		keyExpr = "''"
+	case "user":
+		keyExpr = "user"
+	case "model":
+		keyExpr = "model"
+	default:
+		return nil, fmt.Errorf("unsupported group %q (none|user|model)", group)
+	}
+
+	if loc == nil {
+		loc = time.UTC
+	}
+	_, offset := time.Now().In(loc).Zone()
+
+	var out []SeriesPoint
+	err := r.scope(f).
+		Select(fmt.Sprintf(`strftime('%s', created_at, '%d seconds') as bucket,
+			%s as key,
+			COUNT(*) as requests,
+			COALESCE(SUM(prompt_tokens),0) as prompt_tokens,
+			COALESCE(SUM(completion_tokens),0) as completion_tokens,
+			COALESCE(SUM(total_tokens),0) as total_tokens,
+			COALESCE(SUM(cost_estimate),0) as cost_estimate`, stamp, offset, keyExpr)).
+		Group("bucket, key").
+		Order("bucket ASC, total_tokens DESC").
 		Scan(&out).Error
 	return out, err
 }

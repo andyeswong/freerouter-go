@@ -84,6 +84,7 @@ func (s *Server) Engine() *gin.Engine {
 
 		admin.GET("/usage", s.usageReport)
 		admin.GET("/usage/recent", s.usageRecent)
+		admin.GET("/usage/series", s.usageSeries)
 
 		admin.GET("/secrets", s.secretList)
 		admin.POST("/secrets", s.secretSet)
@@ -428,6 +429,23 @@ func (s *Server) usageReport(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"buckets": buckets})
+}
+
+// usageSeries answers "how much per day (or hour), by whom" — the aggregation
+// the dashboard's trends and per-user daily averages are computed from.
+// Buckets are labeled in the quota timezone so a "day" here is the same day a
+// quota window uses.
+func (s *Server) usageSeries(c *gin.Context) {
+	loc := time.UTC
+	if s.quota != nil {
+		loc = s.quota.Location()
+	}
+	points, err := s.usage.Series(s.usageFilter(c), c.Query("bucket"), c.Query("group"), loc)
+	if err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"points": points, "timezone": loc.String()})
 }
 
 func (s *Server) usageRecent(c *gin.Context) {

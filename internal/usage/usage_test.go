@@ -71,3 +71,67 @@ func TestSumTokensSinceIsScopedToOneToken(t *testing.T) {
 		t.Errorf("sum = %d, want 10 (token 2 must not be counted)", got)
 	}
 }
+
+func TestSeriesBucketsByLocalDay(t *testing.T) {
+	r := newTestRepo(t)
+	loc, err := time.LoadLocation("America/Tijuana")
+	if err != nil {
+		t.Fatalf("load zone: %v", err)
+	}
+
+	// 06:00 UTC on the 28th is still the 27th in Pacific (23:00). It must land
+	// in the 27th's bucket, not the 28th's.
+	seed := []struct {
+		at   time.Time
+		user string
+		tok  int
+	}{
+		{time.Date(2026, 7, 28, 6, 0, 0, 0, time.UTC), "ana", 100},
+		{time.Date(2026, 7, 28, 9, 0, 0, 0, time.UTC), "ana", 30},
+		{time.Date(2026, 7, 28, 10, 0, 0, 0, time.UTC), "beto", 7},
+	}
+	for _, s := range seed {
+		if err := r.db.Create(&Record{TokenID: 1, User: s.user, Model: "m", TotalTokens: s.tok, CreatedAt: s.at}).Error; err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	pts, err := r.Series(Filter{}, "day", "none", loc)
+	if err != nil {
+		t.Fatalf("series: %v", err)
+	}
+	got := map[string]int64{}
+	for _, p := range pts {
+		got[p.Bucket] = p.TotalTokens
+	}
+	if got["2026-07-27"] != 100 {
+		t.Errorf("bucket 2026-07-27 = %d, want 100 (06:00Z is 23:00 Pacific of the 27th)", got["2026-07-27"])
+	}
+	if got["2026-07-28"] != 37 {
+		t.Errorf("bucket 2026-07-28 = %d, want 37", got["2026-07-28"])
+	}
+
+	byUser, err := r.Series(Filter{}, "day", "user", loc)
+	if err != nil {
+		t.Fatalf("series by user: %v", err)
+	}
+	seen := map[string]int64{}
+	for _, p := range byUser {
+		if p.Bucket == "2026-07-28" {
+			seen[p.Key] = p.TotalTokens
+		}
+	}
+	if seen["ana"] != 30 || seen["beto"] != 7 {
+		t.Errorf("grouped by user on the 28th = %v, want ana:30 beto:7", seen)
+	}
+}
+
+func TestSeriesRejectsUnknownBucketAndGroup(t *testing.T) {
+	r := newTestRepo(t)
+	if _, err := r.Series(Filter{}, "week", "none", time.UTC); err == nil {
+		t.Error("bucket=week should be rejected, not silently accepted")
+	}
+	if _, err := r.Series(Filter{}, "day", "user; drop table records", time.UTC); err == nil {
+		t.Error("group must be whitelisted — an arbitrary value reaches SQL otherwise")
+	}
+}
