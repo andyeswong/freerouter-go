@@ -4,13 +4,16 @@ package providers
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andyeswong/freerouter-go/internal/models"
 )
@@ -49,21 +52,175 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		return nil
 	}
 	// Else array of blocks.
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
+	var blocks []map[string]any
 	if err := json.Unmarshal(raw.Content, &blocks); err != nil {
 		return fmt.Errorf("content is neither string nor block array: %w", err)
 	}
 	var parts []string
 	for _, blk := range blocks {
-		if blk.Text != "" {
-			parts = append(parts, blk.Text)
+		if text, ok := BlockText(blk); ok {
+			parts = append(parts, text)
 		}
 	}
 	m.Content = strings.Join(parts, "\n")
 	return nil
+}
+
+// BlockText pulls readable text out of one OpenAI-style content block. Besides
+// the plain {"type":"text","text":...} shape it understands {"type":"file"},
+// which is what Coder's aibridge emits when a large paste is attached to the
+// turn — the payload rides in file.file_data, normally as a data: URI. Reports
+// ok=false when the block carries nothing worth showing the model.
+//
+// Routing reads this too, not just the proxy: a file block used to measure as
+// zero characters, so a huge paste was sized as an empty context.
+func BlockText(blk map[string]any) (string, bool) {
+	if s, ok := blk["text"].(string); ok && s != "" {
+		return s, true
+	}
+	if t, _ := blk["type"].(string); t != "file" {
+		return "", false
+	}
+	f, _ := blk["file"].(map[string]any)
+	if f == nil {
+		f = map[string]any{}
+	}
+	name, _ := f["filename"].(string)
+	data, _ := f["file_data"].(string)
+	if data == "" {
+		// The exact envelope was never captured off the wire (the 400 body named
+		// the variant, not its shape), and clients differ — Anthropic-shaped
+		// bridges nest the payload under source.data. Fall back to the longest
+		// string anywhere in the block so the paste is never silently dropped.
+		data = longestString(blk)
+	}
+	if text, ok := decodeFileData(data); ok {
+		if name != "" {
+			return name + ":\n" + text, true
+		}
+		return text, true
+	}
+	if name != "" {
+		// A real binary attachment: name it rather than splice mojibake into
+		// the prompt, and rather than drop the turn's only content.
+		return "[attachment " + name + " omitted: this model accepts text only]", true
+	}
+	return "", false
+}
+
+// longestString returns the longest string value anywhere inside v, skipping
+// the short bookkeeping fields (type, filename, media types). Used only as the
+// last resort in BlockText, to find an attachment payload whose key we don't
+// recognize.
+func longestString(v any) string {
+	best := ""
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case string:
+			if len(t) > len(best) {
+				best = t
+			}
+		case map[string]any:
+			for k, val := range t {
+				if k == "type" || k == "filename" || k == "media_type" || k == "mime_type" {
+					continue
+				}
+				walk(val)
+			}
+		case []any:
+			for _, val := range t {
+				walk(val)
+			}
+		}
+	}
+	walk(v)
+	return best
+}
+
+// decodeFileData turns a file_data payload into text. Accepts a bare string, a
+// data: URI (base64 or percent-encoded), and plain base64. Reports false when
+// the bytes are not valid UTF-8 — a binary attachment must not reach the model
+// as garbage.
+func decodeFileData(s string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	payload := s
+	switch {
+	case strings.HasPrefix(s, "data:"):
+		comma := strings.IndexByte(s, ',')
+		if comma < 0 {
+			return "", false
+		}
+		meta, rest := s[len("data:"):comma], s[comma+1:]
+		payload = rest
+		if strings.Contains(meta, ";base64") {
+			b, err := base64.StdEncoding.DecodeString(rest)
+			if err != nil {
+				return "", false
+			}
+			payload = string(b)
+		} else if unescaped, err := url.QueryUnescape(rest); err == nil {
+			payload = unescaped
+		}
+	default:
+		// Unlabelled: it may be base64 or it may already be text. Short words
+		// ("hola") happen to be valid base64 and decode to bytes, so only take
+		// the decoded form when it reads back as text.
+		if b, err := base64.StdEncoding.DecodeString(s); err == nil && utf8.Valid(b) {
+			payload = string(b)
+		}
+	}
+	if !utf8.ValidString(payload) {
+		return "", false
+	}
+	return payload, true
+}
+
+// flattenContentBlocks rewrites every message's content array so only block
+// types the providers actually implement survive. DeepSeek rejects the whole
+// request on an unknown variant ("unknown variant `file`, expected `text`",
+// seen in prod 2026-07-29 from the Coder agent whenever a large paste was in
+// the turn), and the others have no shared superset either — plain text is the
+// one shape every endpoint in the vademécum accepts.
+func flattenContentBlocks(body map[string]any) {
+	msgs, ok := body["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		blocks, ok := msg["content"].([]any)
+		if !ok {
+			continue // already a plain string
+		}
+		kept := make([]any, 0, len(blocks))
+		for _, b := range blocks {
+			blk, ok := b.(map[string]any)
+			if !ok {
+				kept = append(kept, b)
+				continue
+			}
+			// text and image_url are the two variants providers agree on; pass
+			// them through untouched so nothing is re-encoded needlessly.
+			if t, _ := blk["type"].(string); t == "text" || t == "image_url" {
+				kept = append(kept, b)
+				continue
+			}
+			if text, ok := BlockText(blk); ok {
+				kept = append(kept, map[string]any{"type": "text", "text": text})
+			}
+		}
+		if len(kept) == 0 {
+			msg["content"] = "" // an empty array 400s on some providers
+			continue
+		}
+		msg["content"] = kept
+	}
 }
 
 // ChatRequest is the subset of the OpenAI chat schema the router inspects.
@@ -199,6 +356,10 @@ func Proxy(m models.LlmModel, rawBody []byte) (*http.Response, error) {
 	body["model"] = m.ModelID
 	delete(body, "tier")
 	delete(body, "requires_mcp")
+
+	// Reduce content blocks to the variants every provider implements, before
+	// anything else appends to messages.
+	flattenContentBlocks(body)
 
 	// Structured output for a model that doesn't implement it: carry the schema
 	// as an instruction and drop the field, which would otherwise earn a 400

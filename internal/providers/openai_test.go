@@ -115,3 +115,90 @@ func TestEmulatesJSONSchema(t *testing.T) {
 		t.Error("a request without response_format must not emulate")
 	}
 }
+
+// A "file" content block — what Coder's aibridge attaches for a large paste —
+// took the whole request down with DeepSeek's "unknown variant `file`,
+// expected `text`" (prod, 2026-07-29). It must reach the provider as text.
+func TestProxyFlattensFileBlocks(t *testing.T) {
+	var seen map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &seen)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	// "hola mundo" as a base64 data URI, the OpenAI file_data shape.
+	body := `{"model":"auto","messages":[{"role":"user","content":[
+	  {"type":"text","text":"resume esto"},
+	  {"type":"file","file":{"filename":"paste.txt","file_data":"data:text/plain;base64,aG9sYSBtdW5kbw=="}}]}]}`
+
+	resp, err := Proxy(models.LlmModel{ModelID: "m1", APIBaseURL: srv.URL}, []byte(body))
+	if err != nil {
+		t.Fatalf("proxy: %v", err)
+	}
+	Drain(resp.Body)
+
+	msgs, _ := seen["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(msgs))
+	}
+	blocks, _ := msgs[0].(map[string]any)["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(blocks))
+	}
+	for i, b := range blocks {
+		if typ, _ := b.(map[string]any)["type"].(string); typ != "text" {
+			t.Errorf("block %d type = %q, want text", i, typ)
+		}
+	}
+	if got, _ := blocks[1].(map[string]any)["text"].(string); !strings.Contains(got, "hola mundo") {
+		t.Errorf("pasted payload lost: block 1 text = %q", got)
+	}
+}
+
+func TestBlockText(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+		ok             bool
+	}{
+		{"plain text block", `{"type":"text","text":"hola"}`, "hola", true},
+		{"file base64 data uri", `{"type":"file","file":{"file_data":"data:text/plain;base64,aG9sYQ=="}}`, "hola", true},
+		{"file plain data uri", `{"type":"file","file":{"file_data":"data:text/plain,hola%20mundo"}}`, "hola mundo", true},
+		{"file bare text", `{"type":"file","file":{"file_data":"hola mundo"}}`, "hola mundo", true},
+		{"filename prefixed", `{"type":"file","file":{"filename":"a.txt","file_data":"hola"}}`, "a.txt:\nhola", true},
+		// Unknown envelope (e.g. an Anthropic-shaped bridge): still recovered.
+		{"nested source.data", `{"type":"file","source":{"data":"aG9sYQ=="}}`, "hola", true},
+		{"binary attachment named", `{"type":"file","file":{"filename":"x.pdf","file_data":"data:application/pdf;base64,3q2+7w=="}}`,
+			"[attachment x.pdf omitted: this model accepts text only]", true},
+		{"nothing to show", `{"type":"file"}`, "", false},
+		{"image passes through untouched", `{"type":"image_url","image_url":{"url":"http://x/y.png"}}`, "", false},
+	}
+	for _, tc := range cases {
+		var blk map[string]any
+		if err := json.Unmarshal([]byte(tc.in), &blk); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		got, ok := BlockText(blk)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("%s: BlockText() = (%q,%v), want (%q,%v)", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// Routing sizes the context from Message.Content, so a paste that arrives as a
+// file block must not measure as an empty turn.
+func TestFileBlockCountsTowardContext(t *testing.T) {
+	var req ChatRequest
+	body := `{"messages":[{"role":"user","content":[
+	  {"type":"file","file":{"filename":"p.txt","file_data":"data:text/plain;base64,aG9sYSBtdW5kbw=="}}]}]}`
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !strings.Contains(req.Messages[0].Content, "hola mundo") {
+		t.Errorf("content = %q, want the decoded paste", req.Messages[0].Content)
+	}
+	if ContextChars(req.Messages) <= 8 {
+		t.Error("a file block measured as an empty context")
+	}
+}
