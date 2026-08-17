@@ -13,6 +13,7 @@ import (
 	"github.com/andyeswong/freerouter-go/internal/auth"
 	"github.com/andyeswong/freerouter-go/internal/config"
 	"github.com/andyeswong/freerouter-go/internal/models"
+	"github.com/andyeswong/freerouter-go/internal/promptlog"
 	"github.com/andyeswong/freerouter-go/internal/providers"
 	"github.com/andyeswong/freerouter-go/internal/quota"
 	"github.com/andyeswong/freerouter-go/internal/router"
@@ -80,8 +81,20 @@ func main() {
 	}
 	quotaTracker := quota.NewTracker(usageRepo, loc)
 
+	// Prompt capture: off unless the config (or FRGO_PROMPT_LOG) says otherwise.
+	// New() opens the file up front so a bad path is a boot warning instead of a
+	// silent no-op discovered when someone goes looking for the capture.
+	prompts := promptlog.New(cfg.PromptLog)
+	if cfg.PromptLog.Enabled {
+		if prompts.Size() < 0 {
+			log.Printf("WARNING: prompt log enabled but %s could not be opened — capturing nothing", cfg.PromptLog.Path)
+		} else {
+			log.Printf("prompt log ON -> %s (tokens=%v, max_chars=%d)", cfg.PromptLog.Path, cfg.PromptLog.Tokens, cfg.PromptLog.MaxChars)
+		}
+	}
+
 	rt := router.New(repo, cfg.Heuristic)
-	srv := server.New(repo, rt, tokens, usageRepo, secretsRepo, quotaTracker, cfg.AdminToken)
+	srv := server.New(repo, rt, tokens, usageRepo, secretsRepo, quotaTracker, prompts, cfg.AdminToken)
 
 	log.Printf("FreeRouter-Go listening on %s (db=%s, quota_tz=%s)", cfg.Listen, cfg.DBPath, loc)
 	if err := srv.Engine().Run(cfg.Listen); err != nil {

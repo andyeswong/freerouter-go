@@ -98,22 +98,26 @@ func Classify(prompt string, estTokens int, cfg HeuristicConfig) (models.Tier, f
 		return models.TierReasoning, 0.85
 	}
 
+	var tier models.Tier
+	var conf float64
 	switch {
 	case score < cfg.SimpleMedium:
-		return models.TierSimple, confidence(cfg.SimpleMedium - score)
+		tier, conf = models.TierSimple, confidence(cfg.SimpleMedium-score)
 	case score < cfg.MediumComplex:
-		return models.TierMedium, confidence(min(score-cfg.SimpleMedium, cfg.MediumComplex-score))
+		tier, conf = models.TierMedium, confidence(min(score-cfg.SimpleMedium, cfg.MediumComplex-score))
 	case score < cfg.ComplexReason:
-		return models.TierComplex, confidence(min(score-cfg.MediumComplex, cfg.ComplexReason-score))
+		tier, conf = models.TierComplex, confidence(min(score-cfg.MediumComplex, cfg.ComplexReason-score))
 	default:
-		return models.TierReasoning, confidence(score - cfg.ComplexReason)
+		tier, conf = models.TierReasoning, confidence(score-cfg.ComplexReason)
 	}
-}
 
-// AgenticScore returns true when the prompt looks like it needs an MCP-native
-// model (real tool loop), kept SEPARATE from plain tier (Pillbox 5e2448c).
-func AgenticScore(prompt string, cfg HeuristicConfig) bool {
-	return wordBoundaryCount(prompt, cfg.AgenticKeywords) >= 4
+	// Agentic floor: execution tasks (ssh/deploy/run/corre/ejecuta/despliega…)
+	// need a capable model, so 2+ agentic markers floor the request at COMPLEX
+	// (tier 3). It is a plain tier signal now — NOT the old mcp_native path.
+	if wordBoundaryCount(prompt, cfg.AgenticKeywords) >= 2 && tier < models.TierComplex {
+		tier, conf = models.TierComplex, 0.8
+	}
+	return tier, conf
 }
 
 func confidence(distance float64) float64 {

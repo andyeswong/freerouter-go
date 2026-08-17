@@ -16,6 +16,7 @@ import (
 
 	"github.com/andyeswong/freerouter-go/internal/auth"
 	"github.com/andyeswong/freerouter-go/internal/models"
+	"github.com/andyeswong/freerouter-go/internal/promptlog"
 	"github.com/andyeswong/freerouter-go/internal/providers"
 	"github.com/andyeswong/freerouter-go/internal/quota"
 	"github.com/andyeswong/freerouter-go/internal/router"
@@ -30,14 +31,15 @@ type Server struct {
 	usage      *usage.Repo
 	secrets    *secrets.Repo
 	quota      *quota.Tracker
+	prompts    *promptlog.Logger
 	adminToken string
 
 	seriesMu    sync.Mutex
 	seriesCache map[string]seriesEntry
 }
 
-func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, secretsRepo *secrets.Repo, quotaTracker *quota.Tracker, adminToken string) *Server {
-	return &Server{repo: repo, rt: rt, tokens: tokens, usage: usageRepo, secrets: secretsRepo, quota: quotaTracker, adminToken: adminToken}
+func New(repo *models.Repo, rt *router.Router, tokens *auth.Repo, usageRepo *usage.Repo, secretsRepo *secrets.Repo, quotaTracker *quota.Tracker, prompts *promptlog.Logger, adminToken string) *Server {
+	return &Server{repo: repo, rt: rt, tokens: tokens, usage: usageRepo, secrets: secretsRepo, quota: quotaTracker, prompts: prompts, adminToken: adminToken}
 }
 
 func (s *Server) Engine() *gin.Engine {
@@ -89,6 +91,11 @@ func (s *Server) Engine() *gin.Engine {
 		admin.GET("/usage", s.usageReport)
 		admin.GET("/usage/recent", s.usageRecent)
 		admin.GET("/usage/series", s.usageSeries)
+		admin.GET("/usage/by-tier", s.usageByTier)
+		admin.GET("/usage/models-stats", s.usageModelStats)
+
+		admin.GET("/prompt-log", s.promptLogGet)
+		admin.PUT("/prompt-log", s.promptLogSet)
 
 		admin.GET("/secrets", s.secretList)
 		admin.POST("/secrets", s.secretSet)
@@ -100,6 +107,7 @@ func (s *Server) Engine() *gin.Engine {
 
 // chat: auth (middleware) -> classify -> pick model -> proxy -> relay + record usage.
 func (s *Server) chat(c *gin.Context) {
+	start := time.Now()
 	raw, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "cannot read body"})
@@ -122,9 +130,11 @@ func (s *Server) chat(c *gin.Context) {
 		HasTools:           req.HasTools(),
 		RequiresJSONSchema: req.RequiresJSONSchema(),
 		Tier:               models.Tier(req.Tier),
-		RequiresMCP:        req.RequiresMCP,
 	})
 	if err != nil {
+		if tok, ok := auth.TokenFromCtx(c); ok {
+			go s.recordFailure(tok, "(no candidate)", 0, "", 503, int(time.Since(start).Milliseconds()), 0)
+		}
 		c.JSON(503, gin.H{"error": err.Error()})
 		return
 	}
@@ -133,8 +143,18 @@ func (s *Server) chat(c *gin.Context) {
 	c.Header("X-FreeRouter-Tier", strconv.Itoa(int(decision.Tier)))
 	c.Header("X-FreeRouter-Savings", strconv.FormatFloat(decision.Savings, 'f', 3, 64))
 
+	// Capture the prompt (no-op unless prompt logging is on for this token).
+	// Placed after routing so the entry records which model the traffic hit, and
+	// before proxying so a request that dies upstream still leaves its prompt.
+	if tok, ok := auth.TokenFromCtx(c); ok {
+		s.capturePrompt(tok, req, decision, ctxChars)
+	}
+
 	resp, err := providers.Proxy(decision.Model, raw)
 	if err != nil {
+		if tok, ok := auth.TokenFromCtx(c); ok {
+			go s.recordFailure(tok, decision.Model.Name, int(decision.Tier), decision.Method, 502, int(time.Since(start).Milliseconds()), decision.Savings)
+		}
 		c.JSON(502, gin.H{"error": "upstream error: " + err.Error()})
 		return
 	}
@@ -156,7 +176,7 @@ func (s *Server) chat(c *gin.Context) {
 			c.Header("X-FreeRouter-JSONSchema", "emulated")
 			_, _ = c.Writer.Write(out)
 			if tok, ok := auth.TokenFromCtx(c); ok {
-				go s.recordUsage(tok, decision, out, ctxChars)
+				go s.recordUsage(tok, decision, out, ctxChars, int(time.Since(start).Milliseconds()), resp.StatusCode)
 			}
 			return
 		}
@@ -173,7 +193,7 @@ func (s *Server) chat(c *gin.Context) {
 			// (the response body is already fully relayed above) — run them
 			// off-request so a busy SQLite writer never stalls the next request's
 			// auth check behind this one's bookkeeping.
-			go s.recordUsage(tok, decision, buf.Bytes(), ctxChars)
+			go s.recordUsage(tok, decision, buf.Bytes(), ctxChars, int(time.Since(start).Milliseconds()), resp.StatusCode)
 		}
 	}
 }
@@ -224,7 +244,7 @@ func tightenToJSON(body []byte) []byte {
 // chars-per-token ratio (EMA), and writes a usage row. promptChars is the size
 // of the input (all messages) — used to estimate prompt tokens when the
 // provider doesn't report them (e.g. Ollama Cloud only returns completion).
-func (s *Server) recordUsage(tok *auth.ApiToken, d *router.Decision, body []byte, promptChars int) {
+func (s *Server) recordUsage(tok *auth.ApiToken, d *router.Decision, body []byte, promptChars, durationMs, status int) {
 	u := providers.ParseUsage(body)
 
 	estimated := false
@@ -265,6 +285,26 @@ func (s *Server) recordUsage(tok *auth.ApiToken, d *router.Decision, body []byte
 		TotalTokens:      u.TotalTokens,
 		CostEstimate:     cost,
 		Estimated:        estimated,
+		DurationMs:       durationMs,
+		Status:           status,
+		Method:           d.Method,
+		Savings:          d.Savings,
+	})
+}
+
+// recordFailure books a row for a request that never reached (or came back from)
+// an upstream: a 503 (no eligible model) or a 502 (proxy error). Keeps the
+// routing/reliability view honest — a failure is data, not a gap in the log.
+func (s *Server) recordFailure(tok *auth.ApiToken, model string, tier int, method string, status, durationMs int, savings float64) {
+	_ = s.usage.Add(&usage.Record{
+		TokenID:    tok.ID,
+		User:       tok.Name,
+		Model:      model,
+		Tier:       tier,
+		Status:     status,
+		Method:     method,
+		Savings:    savings,
+		DurationMs: durationMs,
 	})
 }
 
@@ -421,6 +461,104 @@ func (s *Server) tokenSetLimits(c *gin.Context) {
 	c.JSON(200, row)
 }
 
+// capturePrompt hands the parsed request to the prompt log. Everything about
+// whether it actually gets written (enabled? this token? truncation?) lives in
+// promptlog, so the proxy path stays one call.
+func (s *Server) capturePrompt(tok *auth.ApiToken, req providers.ChatRequest, decision *router.Decision, ctxChars int) {
+	if s.prompts == nil || decision == nil {
+		return
+	}
+	msgs := make([]promptlog.Message, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		msgs = append(msgs, promptlog.Message{Role: m.Role, Content: m.Content})
+	}
+	s.prompts.Log(promptlog.Entry{
+		Token:        tok.Name,
+		TokenID:      tok.ID,
+		Model:        decision.Model.Name,
+		Tier:         int(decision.Tier),
+		Method:       decision.Method,
+		Stream:       req.Stream,
+		Tools:        req.HasTools(),
+		ContextChars: ctxChars,
+		Messages:     msgs,
+	})
+}
+
+// promptLogGet reports whether prompts are being captured, for which tokens,
+// and how big the file has grown.
+func (s *Server) promptLogGet(c *gin.Context) {
+	if s.prompts == nil {
+		c.JSON(200, gin.H{"enabled": false, "note": "prompt log not wired"})
+		return
+	}
+	cfg := s.prompts.Config()
+	c.JSON(200, gin.H{
+		"enabled":   cfg.Enabled,
+		"path":      cfg.Path,
+		"tokens":    cfg.Tokens,
+		"max_chars": cfg.MaxChars,
+		"max_bytes": cfg.MaxBytes,
+		"size":      s.prompts.Size(),
+	})
+}
+
+// promptLogSet flips capture on/off and optionally retargets it, live — no
+// restart, which matters because restarting drops in-flight SSE streams.
+// Omitted fields keep their current value; "tokens":[] widens capture to every
+// token, so it must be sent deliberately.
+func (s *Server) promptLogSet(c *gin.Context) {
+	if s.prompts == nil {
+		c.JSON(503, gin.H{"error": "prompt log not wired"})
+		return
+	}
+	var body struct {
+		Enabled  *bool     `json:"enabled"`
+		Path     *string   `json:"path"`
+		Tokens   *[]string `json:"tokens"`
+		MaxChars *int      `json:"max_chars"`
+		MaxBytes *int64    `json:"max_bytes"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+	cfg := s.prompts.Config()
+	if body.Enabled != nil {
+		cfg.Enabled = *body.Enabled
+	}
+	if body.Path != nil {
+		if *body.Path == "" {
+			c.JSON(400, gin.H{"error": "path cannot be empty"})
+			return
+		}
+		cfg.Path = *body.Path
+	}
+	if body.Tokens != nil {
+		cfg.Tokens = *body.Tokens
+	}
+	if body.MaxChars != nil {
+		if *body.MaxChars < 0 {
+			c.JSON(400, gin.H{"error": "max_chars must be >= 0 (0 = whole message)"})
+			return
+		}
+		cfg.MaxChars = *body.MaxChars
+	}
+	if body.MaxBytes != nil {
+		if *body.MaxBytes < 0 {
+			c.JSON(400, gin.H{"error": "max_bytes must be >= 0 (0 = never rotate)"})
+			return
+		}
+		cfg.MaxBytes = *body.MaxBytes
+	}
+	if err := s.prompts.Configure(cfg); err != nil {
+		c.JSON(500, gin.H{"error": "cannot open " + cfg.Path + ": " + err.Error()})
+		return
+	}
+	log.Printf("prompt log: enabled=%t path=%s tokens=%v", cfg.Enabled, cfg.Path, cfg.Tokens)
+	s.promptLogGet(c)
+}
+
 // tokenIssue creates a dev token. The plaintext is returned ONCE here.
 func (s *Server) tokenIssue(c *gin.Context) {
 	var body struct {
@@ -493,6 +631,22 @@ func (s *Server) usageReport(c *gin.Context) {
 		return
 	}
 	c.JSON(200, gin.H{"buckets": buckets})
+}
+func (s *Server) usageByTier(c *gin.Context) {
+	rows, err := s.usage.ByTier(s.usageFilter(c))
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"tiers": rows})
+}
+func (s *Server) usageModelStats(c *gin.Context) {
+	rows, err := s.usage.ModelStats(s.usageFilter(c))
+	if err != nil {
+		c.JSON(500, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"models": rows})
 }
 
 // usageSeries answers "how much per day (or hour), by whom" — the aggregation

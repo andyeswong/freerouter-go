@@ -23,6 +23,12 @@ type Record struct {
 	CostEstimate     float64 `json:"cost_estimate"` // USD, from model pricing × tokens
 	Estimated        bool    `json:"estimated"`     // true when the provider didn't report prompt_tokens and we estimated them
 
+	// Routing + reliability observability (added 2026-08-17).
+	DurationMs int     `json:"duration_ms"` // wall time start→relay-complete
+	Status     int     `json:"status"`      // upstream HTTP status; 502 proxy / 503 no-candidate on failures
+	Method     string  `json:"method"`      // "declared" | "override" | "heuristic"
+	Savings    float64 `json:"savings"`     // fraction vs most-expensive enabled model
+
 	CreatedAt time.Time `gorm:"index" json:"created_at"`
 }
 
@@ -103,6 +109,63 @@ func (r *Repo) Aggregate(f Filter) ([]Bucket, error) {
 			COALESCE(SUM(cost_estimate),0) as cost_estimate`).
 		Group("user, model").
 		Order("total_tokens DESC").
+		Scan(&out).Error
+	return out, err
+}
+
+// TierBucket aggregates usage by (tier, model) — the routing view: where does
+// traffic land and how does each tier map to a model. An error is status>=400.
+type TierBucket struct {
+	Tier         int     `json:"tier"`
+	Model        string  `json:"model"`
+	Requests     int64   `json:"requests"`
+	Errors       int64   `json:"errors"`
+	TotalTokens  int64   `json:"total_tokens"`
+	CostEstimate float64 `json:"cost_estimate"`
+	AvgMs        float64 `json:"avg_ms"`
+}
+
+// ByTier groups usage by tier and the model that served it.
+func (r *Repo) ByTier(f Filter) ([]TierBucket, error) {
+	var out []TierBucket
+	err := r.scope(f).
+		Select(`tier, model,
+			COUNT(*) as requests,
+			COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END),0) as errors,
+			COALESCE(SUM(total_tokens),0) as total_tokens,
+			COALESCE(SUM(cost_estimate),0) as cost_estimate,
+			COALESCE(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END),0) as avg_ms`).
+		Group("tier, model").
+		Order("tier ASC, requests DESC").
+		Scan(&out).Error
+	return out, err
+}
+
+// ModelStat is per-model reliability + latency (the "how is each service
+// behaving" view). Errors = status>=400; avg/max over non-zero durations.
+type ModelStat struct {
+	Model        string  `json:"model"`
+	Requests     int64   `json:"requests"`
+	Errors       int64   `json:"errors"`
+	TotalTokens  int64   `json:"total_tokens"`
+	CostEstimate float64 `json:"cost_estimate"`
+	AvgMs        float64 `json:"avg_ms"`
+	MaxMs        int64   `json:"max_ms"`
+}
+
+// ModelStats groups reliability + latency by model.
+func (r *Repo) ModelStats(f Filter) ([]ModelStat, error) {
+	var out []ModelStat
+	err := r.scope(f).
+		Select(`model,
+			COUNT(*) as requests,
+			COALESCE(SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END),0) as errors,
+			COALESCE(SUM(total_tokens),0) as total_tokens,
+			COALESCE(SUM(cost_estimate),0) as cost_estimate,
+			COALESCE(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END),0) as avg_ms,
+			COALESCE(MAX(duration_ms),0) as max_ms`).
+		Group("model").
+		Order("requests DESC").
 		Scan(&out).Error
 	return out, err
 }

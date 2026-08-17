@@ -33,10 +33,6 @@ const (
 //     tier T is eligible for any model whose TierMax >= T.
 //   - Cost: relative cost rank used for ordering (lower wins).
 //   - Weight: tie-breaker preference (higher wins).
-//   - McpNative: true only for models that can drive a real agentic tool loop
-//     (e.g. Claude Code via cc_bridge). Pills/requests that genuinely need MCP
-//     orchestration filter on this — NOT plain tool use. See Pillbox commit
-//     5e2448c: requires_tooling != requires_mcp.
 type LlmModel struct {
 	ID uint `gorm:"primaryKey" json:"id"`
 
@@ -56,10 +52,9 @@ type LlmModel struct {
 	// provider doesn't report them. Default 4.0.
 	CharsPerToken float64 `gorm:"default:4" json:"chars_per_token"`
 
-	TierMax   Tier `gorm:"index" json:"tier_max"`
-	Cost      int  `gorm:"index" json:"cost"`   // ordering rank, lower = cheaper
-	Weight    int  `json:"weight"`              // tie-breaker, higher = preferred
-	McpNative bool `gorm:"index" json:"mcp_native"`
+	TierMax Tier `gorm:"index" json:"tier_max"`
+	Cost    int  `gorm:"index" json:"cost"`   // ordering rank, lower = cheaper
+	Weight  int  `json:"weight"`              // tie-breaker, higher = preferred
 
 	// CustomSystemPrompt, if set, is injected as a system message at the front
 	// of every request routed to this model — per-model behavior steering

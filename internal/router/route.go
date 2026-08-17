@@ -17,8 +17,7 @@ type Request struct {
 	RequiresJSONSchema bool // response_format=json_schema → only JSONSchemaOK models
 
 	// Optional declared metadata (data-driven path, preferred over heuristics).
-	Tier         models.Tier // 0 = let the classifier decide
-	RequiresMCP  *bool       // nil = infer from AgenticScore
+	Tier models.Tier // 0 = let the classifier decide
 }
 
 // Decision is the routing result plus metadata for logging / savings.
@@ -27,7 +26,6 @@ type Decision struct {
 	Tier        models.Tier
 	Confidence  float64
 	Method      string // "declared" | "override" | "heuristic"
-	RequiresMCP bool
 	CostEstimate float64
 	BaselineCost float64
 	Savings      float64 // fraction [0,1] vs most-expensive enabled model
@@ -81,14 +79,6 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 		tier, conf = Classify(prompt, estTokens(prompt), rt.cfg)
 	}
 
-	// 3. requires_mcp: declared wins, else infer — kept separate from tier.
-	requiresMCP := false
-	if req.RequiresMCP != nil {
-		requiresMCP = *req.RequiresMCP
-	} else {
-		requiresMCP = AgenticScore(prompt, rt.cfg)
-	}
-
 	// Size the real request by ALL messages, not just the last prompt.
 	ctxChars := req.ContextChars
 	if ctxChars == 0 {
@@ -103,7 +93,6 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 
 	cands, err := rt.repo.CandidatesFor(models.CandidateQuery{
 		Tier:               tier,
-		RequiresMCP:        requiresMCP,
 		HasTools:           req.HasTools,
 		RequiresJSONSchema: req.RequiresJSONSchema,
 		ContextChars:       ctxChars,
@@ -133,11 +122,10 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 	}
 
 	d := &Decision{
-		Model:       *pick,
-		Tier:        tier,
-		Confidence:  conf,
-		Method:      method,
-		RequiresMCP: requiresMCP,
+		Model:      *pick,
+		Tier:       tier,
+		Confidence: conf,
+		Method:     method,
 	}
 	// Estimate input tokens for the savings calc using the chosen model's ratio.
 	cpt := pick.CharsPerToken

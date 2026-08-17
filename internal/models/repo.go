@@ -13,7 +13,6 @@ func (r *Repo) AutoMigrate() error { return r.db.AutoMigrate(&LlmModel{}) }
 // CandidateQuery describes what a routing decision needs from a model.
 type CandidateQuery struct {
 	Tier               Tier    // minimum capability the request needs
-	RequiresMCP        bool    // true only when the task needs an agentic/MCP-native model
 	HasTools           bool    // request carries function-calling tools → only ToolsOK models
 	RequiresJSONSchema bool    // response_format=json_schema → only JSONSchemaOK models
 	ContextChars       int     // total chars across ALL messages; 0 = skip context filter
@@ -30,7 +29,6 @@ type CandidateQuery struct {
 // Filters:
 //   - enabled = true
 //   - tier_max >= requested tier (model is capable enough)
-//   - mcp_native = true ONLY when RequiresMCP (plain tool use must NOT pin here)
 //   - json_schema_ok = true ONLY when the caller sent response_format=json_schema
 //   - context fits: each model is judged by ITS OWN chars_per_token ratio —
 //     estimated_input = context_chars/chars_per_token, and the model qualifies
@@ -39,9 +37,6 @@ func (r *Repo) CandidatesFor(q CandidateQuery) ([]LlmModel, error) {
 	tx := r.db.Where("enabled = ?", true).
 		Where("tier_max >= ?", q.Tier)
 
-	if q.RequiresMCP {
-		tx = tx.Where("mcp_native = ?", true)
-	}
 	if q.HasTools {
 		// Exclude models that break stateless function-calling clients.
 		tx = tx.Where("tools_ok = ?", true)

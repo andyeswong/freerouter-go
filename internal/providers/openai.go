@@ -238,8 +238,7 @@ type ChatRequest struct {
 	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
 
 	// FreeRouter extensions (optional, ignored by upstream after stripping).
-	Tier        int   `json:"tier,omitempty"`
-	RequiresMCP *bool `json:"requires_mcp,omitempty"`
+	Tier int `json:"tier,omitempty"`
 }
 
 // HasTools reports whether this is a function-calling conversation — either the

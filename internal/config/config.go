@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	// Embed the IANA database: the binary is built static (CGO_ENABLED=0) and
@@ -14,6 +15,7 @@ import (
 	// leave quota windows on UTC.
 	_ "time/tzdata"
 
+	"github.com/andyeswong/freerouter-go/internal/promptlog"
 	"github.com/andyeswong/freerouter-go/internal/router"
 )
 
@@ -28,6 +30,11 @@ type Config struct {
 	// (Tijuana/Las Vegas) so windows line up with the operators' working day
 	// rather than UTC midnight.
 	QuotaTimezone string `json:"quota_timezone"`
+
+	// PromptLog captures request prompts to a plain-text file. Off by default;
+	// see internal/promptlog. Env FRGO_PROMPT_LOG (1/true/on) and
+	// FRGO_PROMPT_LOG_PATH override, and the admin API can flip it live.
+	PromptLog promptlog.Config `json:"prompt_log"`
 }
 
 func defaults() Config {
@@ -35,6 +42,12 @@ func defaults() Config {
 		Listen:        ":8080",
 		DBPath:        "freerouter.db",
 		QuotaTimezone: "America/Tijuana",
+		PromptLog: promptlog.Config{
+			Enabled:  false,
+			Path:     "prompts.txt",
+			MaxChars: 20000,
+			MaxBytes: 64 << 20, // 64MB, then one rotation
+		},
 		Heuristic: router.HeuristicConfig{
 			SimpleKeywords:    []string{"hi", "hello", "thanks", "yes", "no", "ok"},
 			ReasoningKeywords: []string{"prove", "derive", "analyze", "explain why", "reason", "step by step"},
@@ -80,6 +93,20 @@ func Load() (Config, error) {
 	}
 	if cfg.QuotaTimezone == "" {
 		cfg.QuotaTimezone = defaults().QuotaTimezone
+	}
+	if env := os.Getenv("FRGO_PROMPT_LOG"); env != "" {
+		switch strings.ToLower(strings.TrimSpace(env)) {
+		case "1", "true", "on", "yes":
+			cfg.PromptLog.Enabled = true
+		case "0", "false", "off", "no":
+			cfg.PromptLog.Enabled = false
+		}
+	}
+	if env := os.Getenv("FRGO_PROMPT_LOG_PATH"); env != "" {
+		cfg.PromptLog.Path = env
+	}
+	if cfg.PromptLog.Path == "" {
+		cfg.PromptLog.Path = defaults().PromptLog.Path
 	}
 	return cfg, nil
 }
