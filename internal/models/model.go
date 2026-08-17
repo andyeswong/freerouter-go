@@ -56,6 +56,16 @@ type LlmModel struct {
 	Cost    int  `gorm:"index" json:"cost"`   // ordering rank, lower = cheaper
 	Weight  int  `json:"weight"`              // tie-breaker, higher = preferred
 
+	// Group tags a model into a load-balancing pool. When the routing winner
+	// carries a Group, requests are spread across its healthy peers that tie it
+	// on the ordering keys (same group, tier_max and cost) — genuinely
+	// interchangeable models — drawn weighted by Weight (see router.lbPick).
+	// Empty = no pool: the model is routed by the plain deterministic order, so
+	// ungrouped behavior is unchanged. Two similar models (e.g. MiniMax-M3 and
+	// GLM-5.2 at tier5) sharing a Group split their traffic and back each other
+	// up: if one goes unhealthy its share flows to the peer automatically.
+	Group string `gorm:"index" json:"group"`
+
 	// CustomSystemPrompt, if set, is injected as a system message at the front
 	// of every request routed to this model — per-model behavior steering
 	// (e.g. "do not execute tools, return the command instead").

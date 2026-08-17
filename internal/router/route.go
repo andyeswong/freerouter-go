@@ -2,6 +2,7 @@ package router
 
 import (
 	"errors"
+	"math/rand/v2"
 
 	"github.com/andyeswong/freerouter-go/internal/models"
 )
@@ -121,6 +122,9 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 		return nil, ErrNoCandidate
 	}
 
+	// Load-balance across the winner's group, if it has one.
+	pick = lbPick(cands, pick)
+
 	d := &Decision{
 		Model:      *pick,
 		Tier:       tier,
@@ -136,6 +140,53 @@ func (rt *Router) Route(req Request) (*Decision, error) {
 	rt.computeSavings(d, estInput, req.MaxTokens)
 	d.Reason = method + " -> tier " + tierName(tier)
 	return d, nil
+}
+
+// lbPick spreads load across a group of interchangeable models. Given the
+// deterministic winner, it gathers every healthy candidate that ties it on the
+// ordering keys — same Group, TierMax and Cost — and draws one weighted by
+// Weight. Because the pool is exactly the winning (tier_max, cost) bucket, load
+// balancing never routes to a strictly costlier or higher-tier model: the
+// cheapest-sufficient law holds. A member that is down (or the whole feature,
+// via an empty Group) drops out, so its share flows to the surviving peer and
+// ungrouped routing stays byte-for-byte identical to the plain order.
+func lbPick(cands []models.LlmModel, winner *models.LlmModel) *models.LlmModel {
+	if winner.Group == "" {
+		return winner
+	}
+	var pool []*models.LlmModel
+	total := 0
+	for i := range cands {
+		c := &cands[i]
+		if c.Group != winner.Group || c.TierMax != winner.TierMax || c.Cost != winner.Cost {
+			continue
+		}
+		if c.Health != models.HealthUp && c.Health != models.HealthUnknown {
+			continue
+		}
+		w := c.Weight
+		if w < 1 {
+			w = 1
+		}
+		total += w
+		pool = append(pool, c)
+	}
+	if len(pool) < 2 {
+		return winner
+	}
+	// Weighted draw: r in [0,total) lands in one member's slice ∝ its weight.
+	r := rand.IntN(total)
+	for _, c := range pool {
+		w := c.Weight
+		if w < 1 {
+			w = 1
+		}
+		if r < w {
+			return c
+		}
+		r -= w
+	}
+	return pool[len(pool)-1]
 }
 
 func tierName(t models.Tier) string {
